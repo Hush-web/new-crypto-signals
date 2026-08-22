@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Multi-Asset Consensus Trading Bot – Final (Relaxed Signals + Breakout)
+Multi-Asset Consensus Trading Bot – Final Fixed (Confidence corrected)
 """
 
 import os
@@ -30,6 +30,7 @@ class Config:
     PER_TRADE_RISK_PCT = float(os.getenv("PER_TRADE_RISK_PCT", "0.02"))
     MAX_DAILY_LOSS_PCT = float(os.getenv("MAX_DAILY_LOSS_PCT", "0.05"))
     CONSENSUS_THRESHOLD = float(os.getenv("CONSENSUS_THRESHOLD", "0.60"))
+    MIN_SOURCES = int(os.getenv("MIN_SOURCES", "1"))  # minimum number of non-neutral sources to fire
     CONSECUTIVE_LOSS_LIMIT = int(os.getenv("CONSECUTIVE_LOSS_LIMIT", "3"))
     TRADE_INTERVAL_SECONDS = int(os.getenv("TRADE_INTERVAL_SECONDS", "60"))
     TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
@@ -345,30 +346,48 @@ class BreakoutSource(SignalSource):
             return Signal(-1, 0.65, "breakout")
         return Signal(0, 0.0, "breakout")
 
-# ---------------------------- CONSENSUS ENGINE ----------------------------
+# ---------------------------- CONSENSUS ENGINE (FIXED) ----------------------------
 class ConsensusEngine:
-    def __init__(self, threshold=Config.CONSENSUS_THRESHOLD, weights=Config.SOURCE_WEIGHTS):
+    def __init__(self, threshold=Config.CONSENSUS_THRESHOLD, weights=Config.SOURCE_WEIGHTS, min_sources=Config.MIN_SOURCES):
         self.threshold = threshold
         self.weights = weights
+        self.min_sources = min_sources
 
     def aggregate(self, signals: List[Signal]) -> Tuple[int, float, List[str]]:
-        weighted_sum = 0.0
-        total_weight = 0.0
-        details = []
-        for sig in signals:
-            if sig.direction == 0:
-                continue
-            weight = self.weights.get(sig.source, 0.0)
-            if weight == 0:
-                continue
-            weighted_sum += sig.direction * sig.confidence * weight
-            total_weight += sig.confidence * weight
-            details.append(f"{sig.source}:{sig.direction} ({sig.confidence:.2f})")
-        if total_weight == 0:
-            return 0, 0.0, details
-        avg = weighted_sum / total_weight
-        direction = 1 if avg > self.threshold else (-1 if avg < -self.threshold else 0)
-        return direction, abs(avg), details
+        # Filter non-neutral signals
+        active = [sig for sig in signals if sig.direction != 0]
+        if len(active) < self.min_sources:
+            return 0, 0.0, []
+
+        # Weighted direction (using weights only)
+        sum_dir = 0.0
+        total_w = 0.0
+        for sig in active:
+            w = self.weights.get(sig.source, 1.0)
+            sum_dir += sig.direction * w
+            total_w += w
+        if total_w == 0:
+            return 0, 0.0, []
+        avg_dir = sum_dir / total_w
+
+        # Confidence = weighted average of confidences (not cancelled)
+        conf_num = 0.0
+        conf_den = 0.0
+        for sig in active:
+            w = self.weights.get(sig.source, 1.0)
+            conf_num += sig.confidence * w
+            conf_den += w
+        avg_conf = conf_num / conf_den if conf_den > 0 else 0.0
+
+        # Determine direction based on threshold
+        direction = 0
+        if avg_dir > self.threshold:
+            direction = 1
+        elif avg_dir < -self.threshold:
+            direction = -1
+
+        details = [f"{sig.source}:{sig.direction} ({sig.confidence:.2f})" for sig in active]
+        return direction, avg_conf, details
 
 # ---------------------------- RISK MANAGER ----------------------------
 class RiskManager:
@@ -632,7 +651,7 @@ trader_global = None
 
 @app.route('/')
 def health():
-    return jsonify({"status": "running", "version": "final-relaxed", "time": datetime.now().isoformat()})
+    return jsonify({"status": "running", "version": "final-fixed-conf", "time": datetime.now().isoformat()})
 
 @app.route('/download')
 def download_csv():
