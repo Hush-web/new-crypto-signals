@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-Multi-Asset Consensus Trading Bot – Complete Production Version
-- Regime filter, trend filter, adaptive sizing, backtesting, drawdown stop
+Multi-Asset Consensus Trading Bot – Complete Version (HTML sanitized)
 """
 
 import os
@@ -12,8 +11,9 @@ import logging
 import threading
 import asyncio
 import requests
+import re
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Optional, List, Tuple, Set
 from dotenv import load_dotenv
 from flask import Flask, jsonify, send_file
@@ -30,11 +30,11 @@ class Config:
     MAX_POSITIONS_PER_SYMBOL = int(os.getenv("MAX_POSITIONS_PER_SYMBOL", "1"))
     PER_TRADE_RISK_PCT = float(os.getenv("PER_TRADE_RISK_PCT", "0.02"))
     MAX_DAILY_LOSS_PCT = float(os.getenv("MAX_DAILY_LOSS_PCT", "0.05"))
-    MAX_DRAWDOWN = float(os.getenv("MAX_DRAWDOWN", "0.10"))  # 10% max drawdown
+    MAX_DRAWDOWN = float(os.getenv("MAX_DRAWDOWN", "0.10"))
     CONSENSUS_THRESHOLD = float(os.getenv("CONSENSUS_THRESHOLD", "0.60"))
     MIN_SOURCES = int(os.getenv("MIN_SOURCES", "1"))
     CONSECUTIVE_LOSS_LIMIT = int(os.getenv("CONSECUTIVE_LOSS_LIMIT", "3"))
-    VOLATILITY_MIN = float(os.getenv("VOLATILITY_MIN", "0.02"))  # ATR/Price > 2% to trade
+    VOLATILITY_MIN = float(os.getenv("VOLATILITY_MIN", "0.02"))
     TREND_FILTER = os.getenv("TREND_FILTER", "true").lower() == "true"
     TREND_MA_PERIOD = int(os.getenv("TREND_MA_PERIOD", "200"))
     TRADE_INTERVAL_SECONDS = int(os.getenv("TRADE_INTERVAL_SECONDS", "60"))
@@ -64,6 +64,27 @@ logging.basicConfig(
     level=getattr(logging, Config.LOG_LEVEL)
 )
 logger = logging.getLogger("multi-trader")
+
+# ---------------------------- HTML SANITIZER ----------------------------
+def sanitize_html(text: str) -> str:
+    """Escape HTML tags except allowed ones: b, strong, i, em, u, ins, s, strike, del, a, code, pre."""
+    # Allowed tags (keep them intact)
+    allowed_tags = r'<\/?(b|strong|i|em|u|ins|s|strike|del|a|code|pre)(?:\s[^>]*)?>'
+    # Temporarily replace allowed tags with placeholders
+    placeholders = {}
+    def replacer(match):
+        tag = match.group(0)
+        placeholder = f"__TAG_{len(placeholders)}__"
+        placeholders[placeholder] = tag
+        return placeholder
+    # Replace allowed tags with placeholders
+    temp = re.sub(allowed_tags, replacer, text, flags=re.IGNORECASE)
+    # Escape remaining < and >
+    temp = temp.replace('<', '&lt;').replace('>', '&gt;')
+    # Restore placeholders
+    for placeholder, tag in placeholders.items():
+        temp = temp.replace(placeholder, tag)
+    return temp
 
 # ---------------------------- KUCOIN SYMBOL VALIDATOR ----------------------------
 def get_kucoin_symbols() -> Set[str]:
@@ -200,7 +221,6 @@ class PerformanceLogger:
                     best = pnl
                 if pnl < worst:
                     worst = pnl
-                # Calculate drawdown based on balance_after
                 balance = float(r['balance_after'])
                 if balance > peak:
                     peak = balance
@@ -389,7 +409,6 @@ class ConsensusEngine:
         if total_w == 0:
             return 0, 0.0, []
         avg_dir = sum_dir / total_w
-        # Confidence
         conf_num = 0.0
         conf_den = 0.0
         for sig in active:
@@ -447,16 +466,14 @@ class RiskManager:
                 return False, "Consecutive loss limit"
             if self.get_drawdown_pct() > self.config['MAX_DRAWDOWN']:
                 return False, f"Max drawdown ({self.config['MAX_DRAWDOWN']*100:.0f}%) reached"
-            # Regime filter: volatility
             if atr is not None and atr > 0:
                 volatility = atr / price
                 if volatility < self.config['VOLATILITY_MIN']:
                     return False, f"Volatility too low ({volatility*100:.2f}% < {self.config['VOLATILITY_MIN']*100:.2f}%)"
-                if volatility > 0.10:  # too high, avoid extreme volatility
+                if volatility > 0.10:
                     return False, f"Volatility too high ({volatility*100:.2f}%)"
-            # Trend filter
             if Config.TREND_FILTER and not trend_ok:
-                return False, "Trend filter rejected (price not aligned with long-term MA)"
+                return False, "Trend filter rejected"
             return True, "OK"
 
     def compute_position_size(self, balance, price, atr):
@@ -465,7 +482,6 @@ class RiskManager:
             atr = price * 0.02
         stop_distance = atr * 2.5
         size = risk_amount / stop_distance
-        # Cap to 50% of balance to avoid over-concentration
         return min(size, (balance * 0.5) / price)
 
     def open_position(self, symbol, side, price, size, stop_loss, take_profit):
@@ -531,7 +547,7 @@ class LiveBroker:
         logger.info(f"[LIVE] {side} {size} {symbol} at {price}")
         return {"status": "live_placeholder"}
 
-# ---------------------------- MULTI-ASSET TRADER (with all filters) ----------------------------
+# ---------------------------- MULTI-ASSET TRADER (with HTML sanitizer) ----------------------------
 class MultiTrader:
     def __init__(self, symbols, initial_balance, risk_mgr, db, telegram_token, chat_id, live_broker):
         valid_symbols = get_kucoin_symbols()
@@ -571,23 +587,33 @@ class MultiTrader:
     def send_alert(self, message):
         if not self.telegram_token or not self.chat_id:
             return
+        # Sanitize HTML to avoid BadRequest
+        safe_msg = sanitize_html(message)
         try:
             requests.post(
                 f"https://api.telegram.org/bot{self.telegram_token}/sendMessage",
-                json={"chat_id": self.chat_id, "text": message, "parse_mode": "HTML"},
+                json={"chat_id": self.chat_id, "text": safe_msg, "parse_mode": "HTML"},
                 timeout=30
             )
         except Exception as e:
             logger.error(f"Telegram send error: {e}")
+            # Fallback: send plain text without parse_mode
+            try:
+                requests.post(
+                    f"https://api.telegram.org/bot{self.telegram_token}/sendMessage",
+                    json={"chat_id": self.chat_id, "text": message[:500] + "..." if len(message)>500 else message},
+                    timeout=30
+                )
+            except:
+                pass
 
     def get_price_and_atr(self, symbol):
         ohlcv = self.markets[symbol].get_ohlcv(limit=100, timeframe='1hour')
         if ohlcv is None or len(ohlcv) < 50:
-            return None, None, None
+            return None, None, None, None
         close = ohlcv[:, 3]
         high = ohlcv[:, 1]
         low = ohlcv[:, 2]
-        # ATR
         high_curr = high[1:]
         low_curr = low[1:]
         prev_close = close[:-1]
@@ -597,13 +623,12 @@ class MultiTrader:
         tr = np.maximum(tr1, np.maximum(tr2, tr3))
         atr = np.mean(tr[-14:]) if len(tr) >= 14 else np.mean(tr)
         price = close[-1]
-        # Trend filter: 200-period MA
         if len(close) >= Config.TREND_MA_PERIOD:
             trend_ma = np.mean(close[-Config.TREND_MA_PERIOD:])
-            trend_ok = price > trend_ma  # bullish if above, bearish if below (we'll check direction later)
+            trend_ok = price > trend_ma
         else:
             trend_ma = None
-            trend_ok = True  # fallback
+            trend_ok = True
         return price, atr, trend_ok, trend_ma
 
     def execute_signal(self, symbol, direction, confidence, price, atr, details, sentiment_score, trend_ok):
@@ -631,7 +656,7 @@ class MultiTrader:
         self.risk_mgr.update_balance(self.balance)
         self.db.log_trade(int(time.time()), symbol, side, price, size, 0.0, 0.0, self.balance)
 
-        details_html = "<br>".join([f"• {d}" for d in details])
+        details_html = "<br>".join([sanitize_html(f"• {d}") for d in details])
         sentiment_label = "🚀 Bullish" if sentiment_score == 1 else ("🔻 Bearish" if sentiment_score == -1 else "⚖️ Neutral")
         msg = (
             f"🔔 <b>{symbol} SIGNAL</b> ({'LIVE' if self.live_broker.enabled else 'PAPER'})\n"
@@ -654,7 +679,6 @@ class MultiTrader:
                 continue
             price, atr, trend_ok, trend_ma = result
 
-            # Check SL/TP
             pnl, status, pos = self.risk_mgr.check_sl_tp(symbol, price)
             if pnl != 0 and pos is not None:
                 self.balance += pnl
@@ -676,7 +700,6 @@ class MultiTrader:
             if self.risk_mgr.open_positions.get(symbol, []):
                 continue
 
-            # Gather signals
             signals = []
             sentiment = 0
             for src in self.sources[symbol]:
@@ -706,26 +729,19 @@ class MultiTrader:
 
     # ---------------------------- BACKTEST FUNCTION ----------------------------
     def backtest(self, symbol, lookback_days=30, timeframe='1hour'):
-        """Run a backtest on historical data for a given symbol."""
         ohlcv = self.markets[symbol].get_ohlcv(limit=lookback_days*24, timeframe=timeframe)
         if ohlcv is None or len(ohlcv) < 50:
             return "Insufficient data for backtest."
-        # Simulate trades using the same consensus logic
         balance = 10000.0
-        positions = []
         pnl_list = []
         wins = 0
         losses = 0
-        for i in range(50, len(ohlcv)-1):  # need at least 50 bars for indicators
-            # Extract current data slice
+        for i in range(50, len(ohlcv)-1):
             current_ohlcv = ohlcv[:i+1]
-            # Simulate signal sources
-            # We'll just use MA and RSI for speed
             close = current_ohlcv[:, 3]
             ma20 = np.mean(close[-20:])
             ma50 = np.mean(close[-50:])
             ma_signal = 1 if ma20 > ma50 else (-1 if ma20 < ma50 else 0)
-            # RSI
             deltas = np.diff(close)
             gains = deltas[deltas > 0]
             losses_arr = -deltas[deltas < 0]
@@ -739,15 +755,13 @@ class MultiTrader:
                 else:
                     rsi = 100 - (100 / (1 + avg_gain/avg_loss))
                     rsi_signal = 1 if rsi < 40 else (-1 if rsi > 60 else 0)
-            # Sentiment (simulate from price change)
             price = close[-1]
             if i > 0:
                 change = (price / close[-2] - 1) * 100
-                volume = 1000000  # dummy
+                volume = 1000000
                 sent_signal = 1 if change > 1.5 else (-1 if change < -1.5 else 0)
             else:
                 sent_signal = 0
-            # Combine
             active = []
             if ma_signal != 0:
                 active.append(Signal(ma_signal, 0.60, "technical_ma"))
@@ -760,11 +774,9 @@ class MultiTrader:
             direction, conf, details = self.consensus.aggregate(active)
             if direction == 0 or conf < Config.CONSENSUS_THRESHOLD:
                 continue
-            # Simulate entry and exit at next bar's close
-            next_price = ohlcv[i+1][3]  # close of next bar
+            next_price = ohlcv[i+1][3]
             entry_price = price
             exit_price = next_price
-            # Compute ATR from current slice for SL/TP
             high = current_ohlcv[:, 1]
             low = current_ohlcv[:, 2]
             high_curr = high[1:]
@@ -778,7 +790,6 @@ class MultiTrader:
             risk = atr * 2.5
             stop_loss = entry_price - risk if direction == 1 else entry_price + risk
             take_profit = entry_price + risk * 1.5 if direction == 1 else entry_price - risk * 1.5
-            # Check if exit hits SL/TP
             if direction == 1:
                 if exit_price <= stop_loss:
                     exit_price = stop_loss
@@ -797,8 +808,7 @@ class MultiTrader:
                     status = "TP"
                 else:
                     status = "Close"
-            # Compute PnL
-            size = (balance * 0.02) / (atr * 2.5)  # simulate risk-based sizing
+            size = (balance * 0.02) / (atr * 2.5)
             if direction == 1:
                 pnl = (exit_price - entry_price) * size
             else:
@@ -809,7 +819,7 @@ class MultiTrader:
                 wins += 1
             else:
                 losses += 1
-            if len(pnl_list) > 50:  # limit for speed
+            if len(pnl_list) > 50:
                 break
         total_trades = wins + losses
         if total_trades == 0:
@@ -841,7 +851,7 @@ trader_global = None
 
 @app.route('/')
 def health():
-    return jsonify({"status": "running", "version": "complete", "time": datetime.now().isoformat()})
+    return jsonify({"status": "running", "version": "complete-html-fix", "time": datetime.now().isoformat()})
 
 @app.route('/download')
 def download_csv():
@@ -890,12 +900,13 @@ async def status_cmd(update: Update, context):
         return
     t = trader_global
     drawdown = t.risk_mgr.get_drawdown_pct() * 100
-    await update.message.reply_text(
+    msg = (
         f"📊 <b>Status</b>\nBalance: ${t.balance:.2f}\nDaily PnL: ${t.db.get_daily_pnl():.2f}\n"
         f"Open Positions: {t.risk_mgr.get_total_positions()}\n"
-        f"Drawdown: {drawdown:.2f}%\nRunning: {'✅' if t.running else '⏸️'}",
-        parse_mode='HTML', reply_markup=get_main_keyboard()
+        f"Drawdown: {drawdown:.2f}%\nRunning: {'✅' if t.running else '⏸️'}"
     )
+    safe_msg = sanitize_html(msg)
+    await update.message.reply_text(safe_msg, parse_mode='HTML', reply_markup=get_main_keyboard())
 
 async def performance(update: Update, context):
     if trader_global is None:
@@ -918,7 +929,8 @@ async def performance(update: Update, context):
         f"Profit Factor: {summary['profit_factor']:.2f}\n"
         f"Balance: ${summary['current_balance']:.2f}"
     )
-    await update.message.reply_text(msg, parse_mode='HTML', reply_markup=get_main_keyboard())
+    safe_msg = sanitize_html(msg)
+    await update.message.reply_text(safe_msg, parse_mode='HTML', reply_markup=get_main_keyboard())
 
 async def backtest(update: Update, context):
     if trader_global is None:
@@ -951,7 +963,8 @@ async def backtest(update: Update, context):
                 f"Max Drawdown: {result['max_drawdown']:.2f}%\n"
                 f"Profit Factor: {result['profit_factor']:.2f}"
             )
-            await update.message.reply_text(msg, parse_mode='HTML', reply_markup=get_main_keyboard())
+            safe_msg = sanitize_html(msg)
+            await update.message.reply_text(safe_msg, parse_mode='HTML', reply_markup=get_main_keyboard())
     except Exception as e:
         await update.message.reply_text(f"Error in backtest: {e}", reply_markup=get_main_keyboard())
 
@@ -973,7 +986,7 @@ async def scan(update: Update, context):
         if signals:
             direction, conf, details = trader_global.consensus.aggregate(signals)
             trend_info = f"Trend OK: {'✅' if trend_ok else '❌'}"
-            await update.message.reply_text(
+            msg = (
                 f"⚖️ {sym}: {'BUY' if direction==1 else 'SELL' if direction==-1 else 'NEUTRAL'}\n"
                 f"Confidence: {conf:.2f}\n"
                 f"Price: ${price:.2f}\n"
@@ -981,8 +994,10 @@ async def scan(update: Update, context):
                 f"Trend: {trend_info}\n"
                 f"Sources: {' | '.join([f'{s.source}:{s.direction} ({s.confidence:.2f})' for s in signals])}"
             )
+            safe_msg = sanitize_html(msg)
+            await update.message.reply_text(safe_msg, reply_markup=get_main_keyboard())
         else:
-            await update.message.reply_text(f"⚠️ No signals for {sym}")
+            await update.message.reply_text(f"⚠️ No signals for {sym}", reply_markup=get_main_keyboard())
     await update.message.reply_text("✅ Scan complete.", reply_markup=get_main_keyboard())
 
 async def pause(update: Update, context):
