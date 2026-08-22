@@ -1,0 +1,5 @@
+Flask==3.0.3
+requests==2.31.0
+pandas==2.2.2
+numpy==1.26.4
+python-telegram-bot==20.7
