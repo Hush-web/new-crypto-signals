@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """
-Multi-Asset Consensus Trading Bot – KuCoin Edition (Auto-validate symbols)
+Multi-Asset Consensus Trading Bot – KuCoin Edition (Final)
+- Runs Telegram on main thread (fixes signal handler error)
+- Trading loop and Flask run on background threads
+- Auto-validates symbols against KuCoin
 """
 
 import os
@@ -23,8 +26,6 @@ load_dotenv()
 
 # ---------------------------- CONFIGURATION ----------------------------
 class Config:
-    # These symbols will be validated against KuCoin's active list at startup.
-    # Use dash format, e.g., "BTC-USDT". Slashes are auto-converted.
     SYMBOLS = [s.strip().replace('/', '-') for s in os.getenv("SYMBOLS", "BTC-USDT,ETH-USDT,SOL-USDT,AVAX-USDT,POL-USDT").split(',') if s.strip()]
     INITIAL_BALANCE = float(os.getenv("INITIAL_BALANCE", "10000.0"))
     MAX_POSITIONS_GLOBAL = int(os.getenv("MAX_POSITIONS_GLOBAL", "5"))
@@ -625,7 +626,7 @@ trader_global = None
 
 @app.route('/')
 def health():
-    return jsonify({"status": "running", "version": "kucoin-validator", "time": datetime.now().isoformat()})
+    return jsonify({"status": "running", "version": "kucoin-validator-final", "time": datetime.now().isoformat()})
 
 @app.route('/download')
 def download_csv():
@@ -742,10 +743,10 @@ async def handle_button(update: Update, context):
         await help_cmd(update, context)
 
 def run_telegram():
+    """Run the Telegram bot (must be called from main thread)."""
     if not Config.TELEGRAM_TOKEN:
+        logger.warning("No Telegram token, skipping bot.")
         return
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
     app_tg = Application.builder().token(Config.TELEGRAM_TOKEN).build()
     app_tg.add_handler(CommandHandler("start", start))
     app_tg.add_handler(CommandHandler("help", help_cmd))
@@ -759,18 +760,7 @@ def run_telegram():
 
 # ---------------------------- MAIN ----------------------------
 if __name__ == "__main__":
-    flask_thread = threading.Thread(target=app.run, kwargs={'host':'0.0.0.0', 'port':int(os.getenv('PORT', 5000))})
-    flask_thread.daemon = True
-    flask_thread.start()
-
-    if Config.TELEGRAM_TOKEN:
-        tg_thread = threading.Thread(target=run_telegram)
-        tg_thread.daemon = True
-        tg_thread.start()
-        logger.info("Telegram bot started.")
-
-    live_broker = LiveBroker(Config.EXCHANGE_NAME, Config.EXCHANGE_API_KEY, Config.EXCHANGE_SECRET)
-
+    # Initialize core components
     db = TradeDB(Config.DB_FILE)
     risk_mgr = RiskManager(Config.INITIAL_BALANCE, {
         'MAX_DAILY_LOSS_PCT': Config.MAX_DAILY_LOSS_PCT,
@@ -779,7 +769,9 @@ if __name__ == "__main__":
         'CONSECUTIVE_LOSS_LIMIT': Config.CONSECUTIVE_LOSS_LIMIT,
         'PER_TRADE_RISK_PCT': Config.PER_TRADE_RISK_PCT,
     })
+    live_broker = LiveBroker(Config.EXCHANGE_NAME, Config.EXCHANGE_API_KEY, Config.EXCHANGE_SECRET)
 
+    # Create trader instance
     trader = MultiTrader(
         symbols=Config.SYMBOLS,
         initial_balance=Config.INITIAL_BALANCE,
@@ -790,4 +782,24 @@ if __name__ == "__main__":
         live_broker=live_broker
     )
     trader_global = trader
-    trader.run_loop()
+
+    # Start trading loop in a background thread
+    trading_thread = threading.Thread(target=trader.run_loop, daemon=True)
+    trading_thread.start()
+
+    # Start Flask server in a background thread
+    flask_thread = threading.Thread(
+        target=app.run,
+        kwargs={'host': '0.0.0.0', 'port': int(os.getenv('PORT', 5000))},
+        daemon=True
+    )
+    flask_thread.start()
+
+    # Run Telegram bot on the main thread (required for signal handling)
+    if Config.TELEGRAM_TOKEN:
+        logger.info("Starting Telegram bot on main thread...")
+        run_telegram()
+    else:
+        # If no Telegram token, keep main thread alive by joining trading thread
+        logger.warning("No Telegram token – main thread will keep running.")
+        trading_thread.join()
