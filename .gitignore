@@ -1,0 +1,5 @@
+.env
+trades.db
+trades.csv
+*.pyc
+__pycache__/
