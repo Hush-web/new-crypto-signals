@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Multi-Asset Consensus Trading Bot – Fully Fixed
-- ATR broadcast error fixed
-- Binance API robust handling
+Multi-Asset Consensus Trading Bot – KuCoin Edition
+- No Binance (uses KuCoin public API – works from Render)
+- ATR broadcast fixed
 - Telegram event loop fixed
 - CSV download endpoint
 """
@@ -16,7 +16,7 @@ import threading
 import asyncio
 import requests
 import numpy as np
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, List, Tuple
 from dotenv import load_dotenv
 from flask import Flask, jsonify, send_file
@@ -50,8 +50,8 @@ class Config:
     SOURCE_WEIGHTS = {
         "technical_ma": float(os.getenv("WEIGHT_MA", "0.6")),
         "technical_rsi": float(os.getenv("WEIGHT_RSI", "0.4")),
-        "orderbook": float(os.getenv("WEIGHT_ORDERBOOK", "0.8")),
-        "whale": float(os.getenv("WEIGHT_WHALE", "0.7")),
+        "orderbook": float(os.getenv("WEIGHT_ORDERBOOK", "0.0")),   # disabled
+        "whale": float(os.getenv("WEIGHT_WHALE", "0.0")),           # disabled
         "sentiment": float(os.getenv("WEIGHT_SENTIMENT", "0.5")),
     }
 
@@ -193,82 +193,80 @@ class PerformanceLogger:
             logger.error(f"CSV read error: {e}")
             return None
 
-# ---------------------------- MARKET DATA (robust) ----------------------------
+# ---------------------------- MARKET DATA (KuCoin – works on Render) ----------------------------
 class MarketData:
     def __init__(self, symbol):
         self.symbol = symbol
         self.base, self.quote = symbol.split('/')
+        # KuCoin uses hyphen for symbol
+        self.kucoin_symbol = f"{self.base}-{self.quote}"
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": "Mozilla/5.0"})
 
-    def _fetch(self, endpoint, params, max_retries=2):
-        for attempt in range(max_retries):
-            try:
-                resp = self.session.get(endpoint, params=params, timeout=10)
-                if resp.status_code != 200:
-                    logger.error(f"Binance {endpoint} {self.symbol} status {resp.status_code}")
-                    time.sleep(2 ** attempt)
-                    continue
-                return resp.json()
-            except Exception:
-                time.sleep(2 ** attempt)
-        return None
-
-    def get_ohlcv(self, limit=100, timeframe='1h'):
-        endpoint = "https://api.binance.com/api/v3/klines"
-        params = {"symbol": self.base+self.quote, "interval": timeframe, "limit": limit}
-        data = self._fetch(endpoint, params)
-        if not isinstance(data, list) or len(data) < 14:
+    def _fetch_kucoin(self, endpoint, params=None):
+        """Generic KuCoin GET request."""
+        url = f"https://api.kucoin.com{endpoint}"
+        try:
+            resp = self.session.get(url, params=params, timeout=10)
+            if resp.status_code != 200:
+                logger.error(f"KuCoin {endpoint} error {resp.status_code}: {resp.text[:100]}")
+                return None
+            data = resp.json()
+            if data.get('code') != '200000':
+                logger.error(f"KuCoin API error: {data.get('msg')}")
+                return None
+            return data.get('data')
+        except Exception as e:
+            logger.error(f"KuCoin request error: {e}")
             return None
+
+    def get_ohlcv(self, limit=100, timeframe='1hour'):
+        """Fetch OHLCV from KuCoin."""
+        # KuCoin returns latest candles first; we reverse to have oldest first
+        params = {
+            "symbol": self.kucoin_symbol,
+            "type": timeframe,  # 1hour, 1day, etc.
+            "limit": limit
+        }
+        data = self._fetch_kucoin("/api/v1/market/candles", params)
+        if not data:
+            return None
+        # data is list of [time, open, close, high, low, volume]
+        # We need to reverse to chronological order
+        data = data[::-1]
         ohlcv = []
         for candle in data:
             try:
-                ohlcv.append([float(candle[1]), float(candle[2]), float(candle[3]),
-                              float(candle[4]), float(candle[5])])
+                ohlcv.append([
+                    float(candle[1]),  # open
+                    float(candle[3]),  # high
+                    float(candle[4]),  # low
+                    float(candle[2]),  # close
+                    float(candle[5])   # volume
+                ])
             except:
                 continue
-        return np.array(ohlcv) if len(ohlcv) >= 14 else None
+        if len(ohlcv) < 14:
+            return None
+        return np.array(ohlcv)
 
     def get_orderbook(self, limit=20):
-        endpoint = "https://api.binance.com/api/v3/depth"
-        params = {"symbol": self.base+self.quote, "limit": limit}
-        data = self._fetch(endpoint, params)
-        if not data:
-            return [], []
-        try:
-            bids = [(float(p), float(q)) for p,q in data['bids'][:limit]]
-            asks = [(float(p), float(q)) for p,q in data['asks'][:limit]]
-            return bids, asks
-        except:
-            return [], []
+        """Disabled – we set weight to 0, but keep method for compatibility."""
+        return [], []
 
     def get_recent_trades(self, limit=100):
-        endpoint = "https://api.binance.com/api/v3/trades"
-        params = {"symbol": self.base+self.quote, "limit": limit}
-        data = self._fetch(endpoint, params)
-        if not data:
-            return None
-        trades = []
-        try:
-            for t in data:
-                trades.append({
-                    'price': float(t['price']),
-                    'qty': float(t['qty']),
-                    'isBuyerMaker': t['isBuyerMaker']
-                })
-            return trades
-        except:
-            return None
+        """Disabled – weight to 0."""
+        return None
 
     def get_24h_change(self):
-        endpoint = "https://api.binance.com/api/v3/ticker/24hr"
-        params = {"symbol": self.base+self.quote}
-        data = self._fetch(endpoint, params)
+        """Fetch 24h stats from KuCoin."""
+        params = {"symbol": self.kucoin_symbol}
+        data = self._fetch_kucoin("/api/v1/market/stats", params)
         if not data:
             return 0, 0, 0
         try:
-            change = float(data['priceChangePercent'])
-            volume = float(data['quoteVolume'])
+            change = float(data.get('changeRate', 0)) * 100  # KuCoin gives decimal
+            volume = float(data.get('vol', 0))
             if change > 2 and volume > 1_000_000:
                 return 1, change, volume
             elif change < -2 and volume > 1_000_000:
@@ -277,7 +275,7 @@ class MarketData:
         except:
             return 0, 0, 0
 
-# ---------------------------- SIGNAL CLASSES ----------------------------
+# ---------------------------- SIGNAL CLASSES (using only MA, RSI, Sentiment) ----------------------------
 class Signal:
     def __init__(self, direction, confidence, source, timestamp=None):
         self.direction = direction
@@ -294,7 +292,7 @@ class SignalSource:
 
 class MASource(SignalSource):
     def fetch(self):
-        ohlcv = self.market.get_ohlcv(limit=100, timeframe='1h')
+        ohlcv = self.market.get_ohlcv(limit=100, timeframe='1hour')
         if ohlcv is None or len(ohlcv) < 50:
             return None
         close = ohlcv[:, 3]
@@ -309,7 +307,7 @@ class MASource(SignalSource):
 
 class RSISource(SignalSource):
     def fetch(self):
-        ohlcv = self.market.get_ohlcv(limit=100, timeframe='1h')
+        ohlcv = self.market.get_ohlcv(limit=100, timeframe='1hour')
         if ohlcv is None or len(ohlcv) < 20:
             return None
         close = ohlcv[:, 3]
@@ -331,39 +329,11 @@ class RSISource(SignalSource):
 
 class OrderBookSource(SignalSource):
     def fetch(self):
-        bids, asks = self.market.get_orderbook(limit=20)
-        if not bids or not asks:
-            return None
-        total_bid_vol = sum(q for _, q in bids[:10])
-        total_ask_vol = sum(q for _, q in asks[:10])
-        if total_bid_vol == 0 or total_ask_vol == 0:
-            return None
-        micro_price = (bids[0][0]*total_ask_vol + asks[0][0]*total_bid_vol) / (total_bid_vol+total_ask_vol)
-        mid_price = (bids[0][0] + asks[0][0]) / 2
-        if micro_price > mid_price * 1.002:
-            return Signal(+1, 0.65, "orderbook")
-        elif micro_price < mid_price * 0.998:
-            return Signal(-1, 0.65, "orderbook")
-        return Signal(0, 0.0, "orderbook")
+        return None  # disabled
 
 class WhaleSource(SignalSource):
-    def __init__(self, market_data, db, threshold_usd=50000):
-        super().__init__(market_data, db)
-        self.threshold_usd = threshold_usd
     def fetch(self):
-        trades = self.market.get_recent_trades(limit=50)
-        if trades is None:
-            return None
-        bids, asks = self.market.get_orderbook(1)
-        if not bids or not asks:
-            return None
-        for t in trades:
-            if t['price'] * t['qty'] > self.threshold_usd:
-                if not t['isBuyerMaker']:
-                    return Signal(+1, 0.70, "whale")
-                else:
-                    return Signal(-1, 0.70, "whale")
-        return Signal(0, 0.0, "whale")
+        return None  # disabled
 
 class SentimentSource(SignalSource):
     def fetch(self):
@@ -387,7 +357,9 @@ class ConsensusEngine:
         for sig in signals:
             if sig.direction == 0:
                 continue
-            weight = self.weights.get(sig.source, 1.0)
+            weight = self.weights.get(sig.source, 0.0)
+            if weight == 0:
+                continue
             weighted_sum += sig.direction * sig.confidence * weight
             total_weight += sig.confidence * weight
             details.append(f"{sig.source}:{sig.direction} ({sig.confidence:.2f})")
@@ -397,7 +369,7 @@ class ConsensusEngine:
         direction = 1 if avg > self.threshold else (-1 if avg < -self.threshold else 0)
         return direction, abs(avg), details
 
-# ---------------------------- RISK MANAGER ----------------------------
+# ---------------------------- RISK MANAGER (unchanged) ----------------------------
 class RiskManager:
     def __init__(self, initial_balance, config):
         self.initial_balance = initial_balance
@@ -485,7 +457,7 @@ class RiskManager:
             else:
                 self.consecutive_losses = 0
 
-# ---------------------------- LIVE BROKER (Placeholder) ----------------------------
+# ---------------------------- LIVE BROKER ----------------------------
 class LiveBroker:
     def __init__(self, exchange_name, api_key, secret):
         self.enabled = bool(exchange_name and api_key and secret)
@@ -518,8 +490,6 @@ class MultiTrader:
             self.sources[sym] = [
                 MASource(self.markets[sym], db),
                 RSISource(self.markets[sym], db),
-                OrderBookSource(self.markets[sym], db),
-                WhaleSource(self.markets[sym], db),
                 SentimentSource(self.markets[sym], db)
             ]
         self.running = True
@@ -538,13 +508,12 @@ class MultiTrader:
             logger.error(f"Telegram send error: {e}")
 
     def get_price_and_atr(self, symbol):
-        ohlcv = self.markets[symbol].get_ohlcv(limit=50, timeframe='1h')
+        ohlcv = self.markets[symbol].get_ohlcv(limit=50, timeframe='1hour')
         if ohlcv is None or len(ohlcv) < 20:
             return None, None
         close = ohlcv[:, 3]
         high = ohlcv[:, 1]
         low = ohlcv[:, 2]
-        # Align arrays correctly
         high_curr = high[1:]
         low_curr = low[1:]
         prev_close = close[:-1]
@@ -648,7 +617,7 @@ trader_global = None
 
 @app.route('/')
 def health():
-    return jsonify({"status": "running", "version": "final", "time": datetime.now().isoformat()})
+    return jsonify({"status": "running", "version": "kucoin", "time": datetime.now().isoformat()})
 
 @app.route('/download')
 def download_csv():
