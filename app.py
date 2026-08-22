@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 """
-Multi-Asset Consensus Trading Bot – KuCoin Edition
-- No Binance (uses KuCoin public API – works from Render)
-- ATR broadcast fixed
-- Telegram event loop fixed
-- CSV download endpoint
+Multi-Asset Consensus Trading Bot – KuCoin Edition (Symbols fixed)
+- Correct symbol format: BTC-USDT, ETH-USDT, etc.
+- MATIC replaced with POL (active KuCoin pair)
 """
 
 import os
@@ -16,7 +14,7 @@ import threading
 import asyncio
 import requests
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Optional, List, Tuple
 from dotenv import load_dotenv
 from flask import Flask, jsonify, send_file
@@ -27,7 +25,8 @@ load_dotenv()
 
 # ---------------------------- CONFIGURATION ----------------------------
 class Config:
-    SYMBOLS = [s.strip() for s in os.getenv("SYMBOLS", "BTC/USDT,ETH/USDT,SOL/USDT,AVAX/USDT,MATIC/USDT").split(',') if s.strip()]
+    # Updated symbols – use dash and active KuCoin pairs
+    SYMBOLS = [s.strip() for s in os.getenv("SYMBOLS", "BTC-USDT,ETH-USDT,SOL-USDT,AVAX-USDT,POL-USDT").split(',') if s.strip()]
     INITIAL_BALANCE = float(os.getenv("INITIAL_BALANCE", "10000.0"))
     MAX_POSITIONS_GLOBAL = int(os.getenv("MAX_POSITIONS_GLOBAL", "5"))
     MAX_POSITIONS_PER_SYMBOL = int(os.getenv("MAX_POSITIONS_PER_SYMBOL", "1"))
@@ -193,23 +192,20 @@ class PerformanceLogger:
             logger.error(f"CSV read error: {e}")
             return None
 
-# ---------------------------- MARKET DATA (KuCoin – works on Render) ----------------------------
+# ---------------------------- MARKET DATA (KuCoin) ----------------------------
 class MarketData:
     def __init__(self, symbol):
-        self.symbol = symbol
-        self.base, self.quote = symbol.split('/')
-        # KuCoin uses hyphen for symbol
-        self.kucoin_symbol = f"{self.base}-{self.quote}"
+        self.symbol = symbol  # e.g., "BTC-USDT"
+        self.base, self.quote = symbol.split('-')  # KuCoin uses dash
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": "Mozilla/5.0"})
 
     def _fetch_kucoin(self, endpoint, params=None):
-        """Generic KuCoin GET request."""
         url = f"https://api.kucoin.com{endpoint}"
         try:
             resp = self.session.get(url, params=params, timeout=10)
             if resp.status_code != 200:
-                logger.error(f"KuCoin {endpoint} error {resp.status_code}: {resp.text[:100]}")
+                logger.error(f"KuCoin {endpoint} {self.symbol} status {resp.status_code}: {resp.text[:100]}")
                 return None
             data = resp.json()
             if data.get('code') != '200000':
@@ -221,19 +217,15 @@ class MarketData:
             return None
 
     def get_ohlcv(self, limit=100, timeframe='1hour'):
-        """Fetch OHLCV from KuCoin."""
-        # KuCoin returns latest candles first; we reverse to have oldest first
         params = {
-            "symbol": self.kucoin_symbol,
-            "type": timeframe,  # 1hour, 1day, etc.
+            "symbol": self.symbol,  # already dash format
+            "type": timeframe,
             "limit": limit
         }
         data = self._fetch_kucoin("/api/v1/market/candles", params)
         if not data:
             return None
-        # data is list of [time, open, close, high, low, volume]
-        # We need to reverse to chronological order
-        data = data[::-1]
+        data = data[::-1]  # oldest first
         ohlcv = []
         for candle in data:
             try:
@@ -251,21 +243,18 @@ class MarketData:
         return np.array(ohlcv)
 
     def get_orderbook(self, limit=20):
-        """Disabled – we set weight to 0, but keep method for compatibility."""
-        return [], []
+        return [], []  # disabled
 
     def get_recent_trades(self, limit=100):
-        """Disabled – weight to 0."""
-        return None
+        return None  # disabled
 
     def get_24h_change(self):
-        """Fetch 24h stats from KuCoin."""
-        params = {"symbol": self.kucoin_symbol}
+        params = {"symbol": self.symbol}
         data = self._fetch_kucoin("/api/v1/market/stats", params)
         if not data:
             return 0, 0, 0
         try:
-            change = float(data.get('changeRate', 0)) * 100  # KuCoin gives decimal
+            change = float(data.get('changeRate', 0)) * 100
             volume = float(data.get('vol', 0))
             if change > 2 and volume > 1_000_000:
                 return 1, change, volume
@@ -275,7 +264,7 @@ class MarketData:
         except:
             return 0, 0, 0
 
-# ---------------------------- SIGNAL CLASSES (using only MA, RSI, Sentiment) ----------------------------
+# ---------------------------- SIGNAL SOURCES (MA, RSI, Sentiment) ----------------------------
 class Signal:
     def __init__(self, direction, confidence, source, timestamp=None):
         self.direction = direction
@@ -327,14 +316,6 @@ class RSISource(SignalSource):
             return Signal(-1, 0.50, "technical_rsi")
         return Signal(0, 0.0, "technical_rsi")
 
-class OrderBookSource(SignalSource):
-    def fetch(self):
-        return None  # disabled
-
-class WhaleSource(SignalSource):
-    def fetch(self):
-        return None  # disabled
-
 class SentimentSource(SignalSource):
     def fetch(self):
         score, _, _ = self.market.get_24h_change()
@@ -369,7 +350,7 @@ class ConsensusEngine:
         direction = 1 if avg > self.threshold else (-1 if avg < -self.threshold else 0)
         return direction, abs(avg), details
 
-# ---------------------------- RISK MANAGER (unchanged) ----------------------------
+# ---------------------------- RISK MANAGER ----------------------------
 class RiskManager:
     def __init__(self, initial_balance, config):
         self.initial_balance = initial_balance
@@ -617,7 +598,7 @@ trader_global = None
 
 @app.route('/')
 def health():
-    return jsonify({"status": "running", "version": "kucoin", "time": datetime.now().isoformat()})
+    return jsonify({"status": "running", "version": "kucoin-symbols-fixed", "time": datetime.now().isoformat()})
 
 @app.route('/download')
 def download_csv():
@@ -751,22 +732,18 @@ def run_telegram():
 
 # ---------------------------- MAIN ----------------------------
 if __name__ == "__main__":
-    # Flask
     flask_thread = threading.Thread(target=app.run, kwargs={'host':'0.0.0.0', 'port':int(os.getenv('PORT', 5000))})
     flask_thread.daemon = True
     flask_thread.start()
 
-    # Telegram
     if Config.TELEGRAM_TOKEN:
         tg_thread = threading.Thread(target=run_telegram)
         tg_thread.daemon = True
         tg_thread.start()
         logger.info("Telegram bot started.")
 
-    # Live broker
     live_broker = LiveBroker(Config.EXCHANGE_NAME, Config.EXCHANGE_API_KEY, Config.EXCHANGE_SECRET)
 
-    # DB & Risk
     db = TradeDB(Config.DB_FILE)
     risk_mgr = RiskManager(Config.INITIAL_BALANCE, {
         'MAX_DAILY_LOSS_PCT': Config.MAX_DAILY_LOSS_PCT,
