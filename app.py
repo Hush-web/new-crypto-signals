@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Multi-Asset Consensus Trading Bot – Final Fixed (Confidence corrected)
+Multi-Asset Consensus Trading Bot – Complete Production Version
+- Regime filter, trend filter, adaptive sizing, backtesting, drawdown stop
 """
 
 import os
@@ -12,7 +13,7 @@ import threading
 import asyncio
 import requests
 import numpy as np
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, List, Tuple, Set
 from dotenv import load_dotenv
 from flask import Flask, jsonify, send_file
@@ -29,9 +30,13 @@ class Config:
     MAX_POSITIONS_PER_SYMBOL = int(os.getenv("MAX_POSITIONS_PER_SYMBOL", "1"))
     PER_TRADE_RISK_PCT = float(os.getenv("PER_TRADE_RISK_PCT", "0.02"))
     MAX_DAILY_LOSS_PCT = float(os.getenv("MAX_DAILY_LOSS_PCT", "0.05"))
+    MAX_DRAWDOWN = float(os.getenv("MAX_DRAWDOWN", "0.10"))  # 10% max drawdown
     CONSENSUS_THRESHOLD = float(os.getenv("CONSENSUS_THRESHOLD", "0.60"))
-    MIN_SOURCES = int(os.getenv("MIN_SOURCES", "1"))  # minimum number of non-neutral sources to fire
+    MIN_SOURCES = int(os.getenv("MIN_SOURCES", "1"))
     CONSECUTIVE_LOSS_LIMIT = int(os.getenv("CONSECUTIVE_LOSS_LIMIT", "3"))
+    VOLATILITY_MIN = float(os.getenv("VOLATILITY_MIN", "0.02"))  # ATR/Price > 2% to trade
+    TREND_FILTER = os.getenv("TREND_FILTER", "true").lower() == "true"
+    TREND_MA_PERIOD = int(os.getenv("TREND_MA_PERIOD", "200"))
     TRADE_INTERVAL_SECONDS = int(os.getenv("TRADE_INTERVAL_SECONDS", "60"))
     TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
     TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -129,6 +134,13 @@ class TradeDB:
             )
             return self.cursor.fetchone()[0]
 
+    def get_total_pnl(self):
+        with self.lock:
+            self.cursor.execute(
+                "SELECT COALESCE(SUM(pnl), 0) FROM trades WHERE side IN ('buy','sell')"
+            )
+            return self.cursor.fetchone()[0]
+
     def close(self):
         self.conn.close()
 
@@ -173,6 +185,8 @@ class PerformanceLogger:
             loss_pnls = []
             best = -1e9
             worst = 1e9
+            max_drawdown = 0
+            peak = 0
             for r in rows:
                 pnl = float(r['pnl'])
                 pnl_sum += pnl
@@ -186,6 +200,13 @@ class PerformanceLogger:
                     best = pnl
                 if pnl < worst:
                     worst = pnl
+                # Calculate drawdown based on balance_after
+                balance = float(r['balance_after'])
+                if balance > peak:
+                    peak = balance
+                dd = (peak - balance) / peak if peak > 0 else 0
+                if dd > max_drawdown:
+                    max_drawdown = dd
             win_rate = (wins / total_trades) * 100 if total_trades > 0 else 0
             avg_win = sum(win_pnls) / len(win_pnls) if win_pnls else 0
             avg_loss = sum(loss_pnls) / len(loss_pnls) if loss_pnls else 0
@@ -198,7 +219,9 @@ class PerformanceLogger:
                 'avg_loss': avg_loss,
                 'best_trade': best if best != -1e9 else 0,
                 'worst_trade': worst if worst != 1e9 else 0,
-                'current_balance': last_balance
+                'max_drawdown': max_drawdown,
+                'current_balance': last_balance,
+                'profit_factor': abs(pnl_sum / sum(loss_pnls)) if loss_pnls and sum(loss_pnls) != 0 else float('inf')
             }
         except Exception as e:
             logger.error(f"CSV read error: {e}")
@@ -269,7 +292,7 @@ class MarketData:
         except:
             return 0, 0, 0
 
-# ---------------------------- SIGNAL SOURCES (Relaxed + Breakout) ----------------------------
+# ---------------------------- SIGNAL SOURCES ----------------------------
 class Signal:
     def __init__(self, direction, confidence, source, timestamp=None):
         self.direction = direction
@@ -346,7 +369,7 @@ class BreakoutSource(SignalSource):
             return Signal(-1, 0.65, "breakout")
         return Signal(0, 0.0, "breakout")
 
-# ---------------------------- CONSENSUS ENGINE (FIXED) ----------------------------
+# ---------------------------- CONSENSUS ENGINE ----------------------------
 class ConsensusEngine:
     def __init__(self, threshold=Config.CONSENSUS_THRESHOLD, weights=Config.SOURCE_WEIGHTS, min_sources=Config.MIN_SOURCES):
         self.threshold = threshold
@@ -354,12 +377,9 @@ class ConsensusEngine:
         self.min_sources = min_sources
 
     def aggregate(self, signals: List[Signal]) -> Tuple[int, float, List[str]]:
-        # Filter non-neutral signals
         active = [sig for sig in signals if sig.direction != 0]
         if len(active) < self.min_sources:
             return 0, 0.0, []
-
-        # Weighted direction (using weights only)
         sum_dir = 0.0
         total_w = 0.0
         for sig in active:
@@ -369,8 +389,7 @@ class ConsensusEngine:
         if total_w == 0:
             return 0, 0.0, []
         avg_dir = sum_dir / total_w
-
-        # Confidence = weighted average of confidences (not cancelled)
+        # Confidence
         conf_num = 0.0
         conf_den = 0.0
         for sig in active:
@@ -378,14 +397,11 @@ class ConsensusEngine:
             conf_num += sig.confidence * w
             conf_den += w
         avg_conf = conf_num / conf_den if conf_den > 0 else 0.0
-
-        # Determine direction based on threshold
         direction = 0
         if avg_dir > self.threshold:
             direction = 1
         elif avg_dir < -self.threshold:
             direction = -1
-
         details = [f"{sig.source}:{sig.direction} ({sig.confidence:.2f})" for sig in active]
         return direction, avg_conf, details
 
@@ -394,6 +410,7 @@ class RiskManager:
     def __init__(self, initial_balance, config):
         self.initial_balance = initial_balance
         self.balance = initial_balance
+        self.peak_balance = initial_balance
         self.config = config
         self.open_positions = {}
         self.daily_pnl = 0.0
@@ -403,6 +420,14 @@ class RiskManager:
     def update_balance(self, new_balance):
         with self.lock:
             self.balance = new_balance
+            if new_balance > self.peak_balance:
+                self.peak_balance = new_balance
+
+    def get_drawdown_pct(self):
+        with self.lock:
+            if self.peak_balance == 0:
+                return 0
+            return (self.peak_balance - self.balance) / self.peak_balance
 
     def get_total_positions(self):
         total = 0
@@ -410,7 +435,7 @@ class RiskManager:
             total += len(positions)
         return total
 
-    def can_trade(self, symbol):
+    def can_trade(self, symbol, price, atr, trend_ok):
         with self.lock:
             if self.daily_pnl < -self.config['MAX_DAILY_LOSS_PCT'] * self.initial_balance:
                 return False, "Daily loss limit"
@@ -420,6 +445,18 @@ class RiskManager:
                 return False, "Max per symbol"
             if self.consecutive_losses >= self.config['CONSECUTIVE_LOSS_LIMIT']:
                 return False, "Consecutive loss limit"
+            if self.get_drawdown_pct() > self.config['MAX_DRAWDOWN']:
+                return False, f"Max drawdown ({self.config['MAX_DRAWDOWN']*100:.0f}%) reached"
+            # Regime filter: volatility
+            if atr is not None and atr > 0:
+                volatility = atr / price
+                if volatility < self.config['VOLATILITY_MIN']:
+                    return False, f"Volatility too low ({volatility*100:.2f}% < {self.config['VOLATILITY_MIN']*100:.2f}%)"
+                if volatility > 0.10:  # too high, avoid extreme volatility
+                    return False, f"Volatility too high ({volatility*100:.2f}%)"
+            # Trend filter
+            if Config.TREND_FILTER and not trend_ok:
+                return False, "Trend filter rejected (price not aligned with long-term MA)"
             return True, "OK"
 
     def compute_position_size(self, balance, price, atr):
@@ -428,6 +465,7 @@ class RiskManager:
             atr = price * 0.02
         stop_distance = atr * 2.5
         size = risk_amount / stop_distance
+        # Cap to 50% of balance to avoid over-concentration
         return min(size, (balance * 0.5) / price)
 
     def open_position(self, symbol, side, price, size, stop_loss, take_profit):
@@ -493,7 +531,7 @@ class LiveBroker:
         logger.info(f"[LIVE] {side} {size} {symbol} at {price}")
         return {"status": "live_placeholder"}
 
-# ---------------------------- MULTI-ASSET TRADER ----------------------------
+# ---------------------------- MULTI-ASSET TRADER (with all filters) ----------------------------
 class MultiTrader:
     def __init__(self, symbols, initial_balance, risk_mgr, db, telegram_token, chat_id, live_broker):
         valid_symbols = get_kucoin_symbols()
@@ -528,6 +566,7 @@ class MultiTrader:
             ]
         self.running = True
         self.performance_logger = PerformanceLogger(Config.CSV_FILE)
+        self.last_prices = {}
 
     def send_alert(self, message):
         if not self.telegram_token or not self.chat_id:
@@ -542,12 +581,13 @@ class MultiTrader:
             logger.error(f"Telegram send error: {e}")
 
     def get_price_and_atr(self, symbol):
-        ohlcv = self.markets[symbol].get_ohlcv(limit=50, timeframe='1hour')
-        if ohlcv is None or len(ohlcv) < 20:
-            return None, None
+        ohlcv = self.markets[symbol].get_ohlcv(limit=100, timeframe='1hour')
+        if ohlcv is None or len(ohlcv) < 50:
+            return None, None, None
         close = ohlcv[:, 3]
         high = ohlcv[:, 1]
         low = ohlcv[:, 2]
+        # ATR
         high_curr = high[1:]
         low_curr = low[1:]
         prev_close = close[:-1]
@@ -556,12 +596,22 @@ class MultiTrader:
         tr3 = np.abs(low_curr - prev_close)
         tr = np.maximum(tr1, np.maximum(tr2, tr3))
         atr = np.mean(tr[-14:]) if len(tr) >= 14 else np.mean(tr)
-        return close[-1], atr
+        price = close[-1]
+        # Trend filter: 200-period MA
+        if len(close) >= Config.TREND_MA_PERIOD:
+            trend_ma = np.mean(close[-Config.TREND_MA_PERIOD:])
+            trend_ok = price > trend_ma  # bullish if above, bearish if below (we'll check direction later)
+        else:
+            trend_ma = None
+            trend_ok = True  # fallback
+        return price, atr, trend_ok, trend_ma
 
-    def execute_signal(self, symbol, direction, confidence, price, atr, details, sentiment_score):
-        can_trade, _ = self.risk_mgr.can_trade(symbol)
+    def execute_signal(self, symbol, direction, confidence, price, atr, details, sentiment_score, trend_ok):
+        can_trade, reason = self.risk_mgr.can_trade(symbol, price, atr, trend_ok)
         if not can_trade:
+            logger.info(f"Trade blocked for {symbol}: {reason}")
             return
+
         size = self.risk_mgr.compute_position_size(self.balance, price, atr)
         if size <= 0:
             return
@@ -599,9 +649,12 @@ class MultiTrader:
 
     def step(self):
         for symbol in self.symbols:
-            price, atr = self.get_price_and_atr(symbol)
-            if price is None or atr is None:
+            result = self.get_price_and_atr(symbol)
+            if result is None or result[0] is None:
                 continue
+            price, atr, trend_ok, trend_ma = result
+
+            # Check SL/TP
             pnl, status, pos = self.risk_mgr.check_sl_tp(symbol, price)
             if pnl != 0 and pos is not None:
                 self.balance += pnl
@@ -619,8 +672,11 @@ class MultiTrader:
                     f"Entry: ${pos['entry']:.4f} | Exit: ${price:.4f}\n"
                     f"PnL: ${pnl:.2f} ({pnl_pct:+.2f}%) | Balance: ${self.balance:.2f}"
                 )
+
             if self.risk_mgr.open_positions.get(symbol, []):
                 continue
+
+            # Gather signals
             signals = []
             sentiment = 0
             for src in self.sources[symbol]:
@@ -630,10 +686,13 @@ class MultiTrader:
                     self.db.log_signal(int(time.time()), symbol, sig.source, sig.direction, sig.confidence)
                     if sig.source == "sentiment":
                         sentiment = sig.direction
+
             if signals:
                 direction, conf, details = self.consensus.aggregate(signals)
                 if direction != 0 and conf >= Config.CONSENSUS_THRESHOLD:
-                    self.execute_signal(symbol, direction, conf, price, atr, details, sentiment)
+                    self.execute_signal(symbol, direction, conf, price, atr, details, sentiment, trend_ok)
+
+            self.last_prices[symbol] = price
 
     def run_loop(self):
         logger.info("Starting multi-asset trading loop. Symbols: %s", self.symbols)
@@ -645,13 +704,144 @@ class MultiTrader:
                 logger.error(f"Loop error: {e}", exc_info=True)
                 time.sleep(Config.TRADE_INTERVAL_SECONDS)
 
+    # ---------------------------- BACKTEST FUNCTION ----------------------------
+    def backtest(self, symbol, lookback_days=30, timeframe='1hour'):
+        """Run a backtest on historical data for a given symbol."""
+        ohlcv = self.markets[symbol].get_ohlcv(limit=lookback_days*24, timeframe=timeframe)
+        if ohlcv is None or len(ohlcv) < 50:
+            return "Insufficient data for backtest."
+        # Simulate trades using the same consensus logic
+        balance = 10000.0
+        positions = []
+        pnl_list = []
+        wins = 0
+        losses = 0
+        for i in range(50, len(ohlcv)-1):  # need at least 50 bars for indicators
+            # Extract current data slice
+            current_ohlcv = ohlcv[:i+1]
+            # Simulate signal sources
+            # We'll just use MA and RSI for speed
+            close = current_ohlcv[:, 3]
+            ma20 = np.mean(close[-20:])
+            ma50 = np.mean(close[-50:])
+            ma_signal = 1 if ma20 > ma50 else (-1 if ma20 < ma50 else 0)
+            # RSI
+            deltas = np.diff(close)
+            gains = deltas[deltas > 0]
+            losses_arr = -deltas[deltas < 0]
+            if len(gains) < 14 or len(losses_arr) < 14:
+                rsi_signal = 0
+            else:
+                avg_gain = np.mean(gains[-14:])
+                avg_loss = np.mean(losses_arr[-14:])
+                if avg_loss == 0:
+                    rsi_signal = 0
+                else:
+                    rsi = 100 - (100 / (1 + avg_gain/avg_loss))
+                    rsi_signal = 1 if rsi < 40 else (-1 if rsi > 60 else 0)
+            # Sentiment (simulate from price change)
+            price = close[-1]
+            if i > 0:
+                change = (price / close[-2] - 1) * 100
+                volume = 1000000  # dummy
+                sent_signal = 1 if change > 1.5 else (-1 if change < -1.5 else 0)
+            else:
+                sent_signal = 0
+            # Combine
+            active = []
+            if ma_signal != 0:
+                active.append(Signal(ma_signal, 0.60, "technical_ma"))
+            if rsi_signal != 0:
+                active.append(Signal(rsi_signal, 0.55, "technical_rsi"))
+            if sent_signal != 0:
+                active.append(Signal(sent_signal, 0.50, "sentiment"))
+            if not active:
+                continue
+            direction, conf, details = self.consensus.aggregate(active)
+            if direction == 0 or conf < Config.CONSENSUS_THRESHOLD:
+                continue
+            # Simulate entry and exit at next bar's close
+            next_price = ohlcv[i+1][3]  # close of next bar
+            entry_price = price
+            exit_price = next_price
+            # Compute ATR from current slice for SL/TP
+            high = current_ohlcv[:, 1]
+            low = current_ohlcv[:, 2]
+            high_curr = high[1:]
+            low_curr = low[1:]
+            prev_close = close[:-1]
+            tr1 = high_curr - low_curr
+            tr2 = np.abs(high_curr - prev_close)
+            tr3 = np.abs(low_curr - prev_close)
+            tr = np.maximum(tr1, np.maximum(tr2, tr3))
+            atr = np.mean(tr[-14:]) if len(tr) >= 14 else 0.02 * price
+            risk = atr * 2.5
+            stop_loss = entry_price - risk if direction == 1 else entry_price + risk
+            take_profit = entry_price + risk * 1.5 if direction == 1 else entry_price - risk * 1.5
+            # Check if exit hits SL/TP
+            if direction == 1:
+                if exit_price <= stop_loss:
+                    exit_price = stop_loss
+                    status = "SL"
+                elif exit_price >= take_profit:
+                    exit_price = take_profit
+                    status = "TP"
+                else:
+                    status = "Close"
+            else:
+                if exit_price >= stop_loss:
+                    exit_price = stop_loss
+                    status = "SL"
+                elif exit_price <= take_profit:
+                    exit_price = take_profit
+                    status = "TP"
+                else:
+                    status = "Close"
+            # Compute PnL
+            size = (balance * 0.02) / (atr * 2.5)  # simulate risk-based sizing
+            if direction == 1:
+                pnl = (exit_price - entry_price) * size
+            else:
+                pnl = (entry_price - exit_price) * size
+            balance += pnl
+            pnl_list.append(pnl)
+            if pnl > 0:
+                wins += 1
+            else:
+                losses += 1
+            if len(pnl_list) > 50:  # limit for speed
+                break
+        total_trades = wins + losses
+        if total_trades == 0:
+            return "No trades generated in backtest period."
+        win_rate = wins / total_trades * 100
+        total_pnl = sum(pnl_list)
+        max_dd = 0
+        peak = 10000
+        for b in [10000 + sum(pnl_list[:i+1]) for i in range(len(pnl_list))]:
+            if b > peak:
+                peak = b
+            dd = (peak - b) / peak
+            if dd > max_dd:
+                max_dd = dd
+        return {
+            'symbol': symbol,
+            'period': f"{lookback_days} days",
+            'total_trades': total_trades,
+            'win_rate': win_rate,
+            'total_pnl': total_pnl,
+            'final_balance': balance,
+            'max_drawdown': max_dd * 100,
+            'profit_factor': abs(total_pnl / sum([p for p in pnl_list if p < 0])) if any(p < 0 for p in pnl_list) else float('inf')
+        }
+
 # ---------------------------- FLASK APP ----------------------------
 app = Flask(__name__)
 trader_global = None
 
 @app.route('/')
 def health():
-    return jsonify({"status": "running", "version": "final-fixed-conf", "time": datetime.now().isoformat()})
+    return jsonify({"status": "running", "version": "complete", "time": datetime.now().isoformat()})
 
 @app.route('/download')
 def download_csv():
@@ -667,7 +857,8 @@ def status():
         "balance": trader_global.balance,
         "daily_pnl": trader_global.db.get_daily_pnl(),
         "open_positions": trader_global.risk_mgr.get_total_positions(),
-        "running": trader_global.running
+        "running": trader_global.running,
+        "drawdown": trader_global.risk_mgr.get_drawdown_pct() * 100
     })
 
 # ---------------------------- TELEGRAM BOT ----------------------------
@@ -681,24 +872,28 @@ def get_main_keyboard():
 
 async def start(update: Update, context):
     await update.message.reply_text(
-        "🤖 <b>Consensus Trader</b>\n\nUse buttons or commands:\n"
+        "🤖 <b>Consensus Trader (Complete)</b>\n\n"
+        "Commands:\n"
         "/status – Account\n/scan – Force scan\n/performance – Stats\n"
+        "/backtest <symbol> – Run backtest (e.g., /backtest BTC-USDT)\n"
         "/pause – Pause\n/resume – Resume\n/help – This\n\n"
         "💾 <a href='https://new-crypto-signals.onrender.com/download'>Download CSV</a>",
         parse_mode='HTML', reply_markup=get_main_keyboard(), disable_web_page_preview=True
     )
 
 async def help_cmd(update: Update, context):
-    await update.message.reply_text("Commands: /status, /scan, /performance, /pause, /resume, /help", reply_markup=get_main_keyboard())
+    await update.message.reply_text("Commands: /status, /scan, /performance, /backtest, /pause, /resume, /help", reply_markup=get_main_keyboard())
 
 async def status_cmd(update: Update, context):
     if trader_global is None:
         await update.message.reply_text("Trader not ready.", reply_markup=get_main_keyboard())
         return
     t = trader_global
+    drawdown = t.risk_mgr.get_drawdown_pct() * 100
     await update.message.reply_text(
         f"📊 <b>Status</b>\nBalance: ${t.balance:.2f}\nDaily PnL: ${t.db.get_daily_pnl():.2f}\n"
-        f"Open Positions: {t.risk_mgr.get_total_positions()}\nRunning: {'✅' if t.running else '⏸️'}",
+        f"Open Positions: {t.risk_mgr.get_total_positions()}\n"
+        f"Drawdown: {drawdown:.2f}%\nRunning: {'✅' if t.running else '⏸️'}",
         parse_mode='HTML', reply_markup=get_main_keyboard()
     )
 
@@ -710,23 +905,66 @@ async def performance(update: Update, context):
     if not summary:
         await update.message.reply_text("No trades yet.", reply_markup=get_main_keyboard())
         return
-    await update.message.reply_text(
-        f"📈 <b>Performance</b>\nTrades: {summary['total_trades']}\nWin Rate: {summary['win_rate']:.1f}%\n"
-        f"Total PnL: ${summary['total_pnl']:.2f}\nAvg Win: ${summary['avg_win']:.2f}\n"
-        f"Avg Loss: ${summary['avg_loss']:.2f}\nBest: ${summary['best_trade']:.2f}\n"
-        f"Worst: ${summary['worst_trade']:.2f}\nBalance: ${summary['current_balance']:.2f}",
-        parse_mode='HTML', reply_markup=get_main_keyboard()
+    msg = (
+        f"📈 <b>Performance</b>\n"
+        f"Trades: {summary['total_trades']}\n"
+        f"Win Rate: {summary['win_rate']:.1f}%\n"
+        f"Total PnL: ${summary['total_pnl']:.2f}\n"
+        f"Avg Win: ${summary['avg_win']:.2f}\n"
+        f"Avg Loss: ${summary['avg_loss']:.2f}\n"
+        f"Best: ${summary['best_trade']:.2f}\n"
+        f"Worst: ${summary['worst_trade']:.2f}\n"
+        f"Max Drawdown: {summary['max_drawdown']*100:.2f}%\n"
+        f"Profit Factor: {summary['profit_factor']:.2f}\n"
+        f"Balance: ${summary['current_balance']:.2f}"
     )
+    await update.message.reply_text(msg, parse_mode='HTML', reply_markup=get_main_keyboard())
+
+async def backtest(update: Update, context):
+    if trader_global is None:
+        await update.message.reply_text("Trader not ready.", reply_markup=get_main_keyboard())
+        return
+    args = context.args
+    if not args:
+        await update.message.reply_text("Usage: /backtest SYMBOL e.g., /backtest BTC-USDT", reply_markup=get_main_keyboard())
+        return
+    symbol = args[0].upper()
+    if '-' not in symbol:
+        symbol = symbol.replace('/', '-')
+    if symbol not in trader_global.symbols:
+        await update.message.reply_text(f"Symbol {symbol} not in active list. Active: {', '.join(trader_global.symbols)}", reply_markup=get_main_keyboard())
+        return
+    await update.message.reply_text(f"⏳ Running backtest for {symbol} (may take a moment)...", reply_markup=get_main_keyboard())
+    try:
+        result = trader_global.backtest(symbol, lookback_days=30, timeframe='1hour')
+        if isinstance(result, str):
+            await update.message.reply_text(result, reply_markup=get_main_keyboard())
+        else:
+            msg = (
+                f"📊 <b>Backtest Results</b>\n"
+                f"Symbol: {result['symbol']}\n"
+                f"Period: {result['period']}\n"
+                f"Trades: {result['total_trades']}\n"
+                f"Win Rate: {result['win_rate']:.1f}%\n"
+                f"Total PnL: ${result['total_pnl']:.2f}\n"
+                f"Final Balance: ${result['final_balance']:.2f}\n"
+                f"Max Drawdown: {result['max_drawdown']:.2f}%\n"
+                f"Profit Factor: {result['profit_factor']:.2f}"
+            )
+            await update.message.reply_text(msg, parse_mode='HTML', reply_markup=get_main_keyboard())
+    except Exception as e:
+        await update.message.reply_text(f"Error in backtest: {e}", reply_markup=get_main_keyboard())
 
 async def scan(update: Update, context):
     await update.message.reply_text("🔍 Scanning...", reply_markup=get_main_keyboard())
     if trader_global is None:
         return
     for sym in trader_global.symbols:
-        price, atr = trader_global.get_price_and_atr(sym)
-        if price is None:
+        result = trader_global.get_price_and_atr(sym)
+        if result is None or result[0] is None:
             await update.message.reply_text(f"⚠️ No data for {sym}")
             continue
+        price, atr, trend_ok, trend_ma = result
         signals = []
         for src in trader_global.sources[sym]:
             sig = src.fetch()
@@ -734,9 +972,14 @@ async def scan(update: Update, context):
                 signals.append(sig)
         if signals:
             direction, conf, details = trader_global.consensus.aggregate(signals)
+            trend_info = f"Trend OK: {'✅' if trend_ok else '❌'}"
             await update.message.reply_text(
                 f"⚖️ {sym}: {'BUY' if direction==1 else 'SELL' if direction==-1 else 'NEUTRAL'}\n"
-                f"Confidence: {conf:.2f}\nSources: {' | '.join(details)}"
+                f"Confidence: {conf:.2f}\n"
+                f"Price: ${price:.2f}\n"
+                f"Volatility: {(atr/price)*100:.2f}%\n"
+                f"Trend: {trend_info}\n"
+                f"Sources: {' | '.join([f'{s.source}:{s.direction} ({s.confidence:.2f})' for s in signals])}"
             )
         else:
             await update.message.reply_text(f"⚠️ No signals for {sym}")
@@ -779,6 +1022,7 @@ def run_telegram():
     app_tg.add_handler(CommandHandler("help", help_cmd))
     app_tg.add_handler(CommandHandler("status", status_cmd))
     app_tg.add_handler(CommandHandler("performance", performance))
+    app_tg.add_handler(CommandHandler("backtest", backtest))
     app_tg.add_handler(CommandHandler("scan", scan))
     app_tg.add_handler(CommandHandler("pause", pause))
     app_tg.add_handler(CommandHandler("resume", resume))
@@ -793,6 +1037,8 @@ if __name__ == "__main__":
         'MAX_POSITIONS_PER_SYMBOL': Config.MAX_POSITIONS_PER_SYMBOL,
         'CONSECUTIVE_LOSS_LIMIT': Config.CONSECUTIVE_LOSS_LIMIT,
         'PER_TRADE_RISK_PCT': Config.PER_TRADE_RISK_PCT,
+        'VOLATILITY_MIN': Config.VOLATILITY_MIN,
+        'MAX_DRAWDOWN': Config.MAX_DRAWDOWN,
     })
     live_broker = LiveBroker(Config.EXCHANGE_NAME, Config.EXCHANGE_API_KEY, Config.EXCHANGE_SECRET)
 
