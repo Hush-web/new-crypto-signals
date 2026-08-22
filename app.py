@@ -1,9 +1,6 @@
 #!/usr/bin/env python3
 """
-Multi-Asset Consensus Trading Bot – KuCoin Edition (Final)
-- Runs Telegram on main thread with its own event loop
-- Trading loop and Flask on background threads
-- Auto-validates symbols against KuCoin
+Multi-Asset Consensus Trading Bot – Final (Relaxed Signals + Breakout)
 """
 
 import os
@@ -52,6 +49,7 @@ class Config:
         "orderbook": float(os.getenv("WEIGHT_ORDERBOOK", "0.0")),
         "whale": float(os.getenv("WEIGHT_WHALE", "0.0")),
         "sentiment": float(os.getenv("WEIGHT_SENTIMENT", "0.5")),
+        "breakout": float(os.getenv("WEIGHT_BREAKOUT", "0.7")),
     }
 
 # ---------------------------- LOGGING ----------------------------
@@ -262,15 +260,15 @@ class MarketData:
         try:
             change = float(data.get('changeRate', 0)) * 100
             volume = float(data.get('vol', 0))
-            if change > 2 and volume > 1_000_000:
+            if change > 1.5 and volume > 500_000:
                 return 1, change, volume
-            elif change < -2 and volume > 1_000_000:
+            elif change < -1.5 and volume > 500_000:
                 return -1, change, volume
             return 0, change, volume
         except:
             return 0, 0, 0
 
-# ---------------------------- SIGNAL SOURCES ----------------------------
+# ---------------------------- SIGNAL SOURCES (Relaxed + Breakout) ----------------------------
 class Signal:
     def __init__(self, direction, confidence, source, timestamp=None):
         self.direction = direction
@@ -293,11 +291,10 @@ class MASource(SignalSource):
         close = ohlcv[:, 3]
         ma20 = np.mean(close[-20:])
         ma50 = np.mean(close[-50:])
-        price = close[-1]
-        if ma20 > ma50 and price > ma20:
-            return Signal(+1, 0.55, "technical_ma")
-        elif ma20 < ma50 and price < ma20:
-            return Signal(-1, 0.55, "technical_ma")
+        if ma20 > ma50:
+            return Signal(+1, 0.60, "technical_ma")
+        elif ma20 < ma50:
+            return Signal(-1, 0.60, "technical_ma")
         return Signal(0, 0.0, "technical_ma")
 
 class RSISource(SignalSource):
@@ -316,20 +313,37 @@ class RSISource(SignalSource):
         if avg_loss == 0:
             return None
         rsi = 100 - (100 / (1 + avg_gain/avg_loss))
-        if rsi < 30:
-            return Signal(+1, 0.50, "technical_rsi")
-        elif rsi > 70:
-            return Signal(-1, 0.50, "technical_rsi")
+        if rsi < 40:
+            return Signal(+1, 0.55, "technical_rsi")
+        elif rsi > 60:
+            return Signal(-1, 0.55, "technical_rsi")
         return Signal(0, 0.0, "technical_rsi")
 
 class SentimentSource(SignalSource):
     def fetch(self):
-        score, _, _ = self.market.get_24h_change()
-        if score == 1:
-            return Signal(+1, 0.55, "sentiment")
-        elif score == -1:
-            return Signal(-1, 0.55, "sentiment")
+        score, change, volume = self.market.get_24h_change()
+        if change > 1.5 and volume > 500_000:
+            return Signal(+1, 0.50, "sentiment")
+        elif change < -1.5 and volume > 500_000:
+            return Signal(-1, 0.50, "sentiment")
         return Signal(0, 0.0, "sentiment")
+
+class BreakoutSource(SignalSource):
+    def fetch(self):
+        ohlcv = self.market.get_ohlcv(limit=50, timeframe='1hour')
+        if ohlcv is None or len(ohlcv) < 20:
+            return None
+        high = ohlcv[:, 1]
+        low = ohlcv[:, 2]
+        close = ohlcv[:, 3]
+        recent_high = np.max(high[-20:])
+        recent_low = np.min(low[-20:])
+        price = close[-1]
+        if price > recent_high * 1.002:
+            return Signal(+1, 0.65, "breakout")
+        elif price < recent_low * 0.998:
+            return Signal(-1, 0.65, "breakout")
+        return Signal(0, 0.0, "breakout")
 
 # ---------------------------- CONSENSUS ENGINE ----------------------------
 class ConsensusEngine:
@@ -490,7 +504,8 @@ class MultiTrader:
             self.sources[sym] = [
                 MASource(self.markets[sym], db),
                 RSISource(self.markets[sym], db),
-                SentimentSource(self.markets[sym], db)
+                SentimentSource(self.markets[sym], db),
+                BreakoutSource(self.markets[sym], db)
             ]
         self.running = True
         self.performance_logger = PerformanceLogger(Config.CSV_FILE)
@@ -617,7 +632,7 @@ trader_global = None
 
 @app.route('/')
 def health():
-    return jsonify({"status": "running", "version": "final", "time": datetime.now().isoformat()})
+    return jsonify({"status": "running", "version": "final-relaxed", "time": datetime.now().isoformat()})
 
 @app.route('/download')
 def download_csv():
@@ -735,11 +750,9 @@ async def handle_button(update: Update, context):
 
 # ---------------------------- MAIN ----------------------------
 def run_telegram():
-    """Run the Telegram bot (on main thread)."""
     if not Config.TELEGRAM_TOKEN:
         logger.warning("No Telegram token, skipping bot.")
         return
-    # Create an event loop and set it for this thread
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     app_tg = Application.builder().token(Config.TELEGRAM_TOKEN).build()
@@ -754,7 +767,6 @@ def run_telegram():
     app_tg.run_polling()
 
 if __name__ == "__main__":
-    # Initialize core components
     db = TradeDB(Config.DB_FILE)
     risk_mgr = RiskManager(Config.INITIAL_BALANCE, {
         'MAX_DAILY_LOSS_PCT': Config.MAX_DAILY_LOSS_PCT,
@@ -765,7 +777,6 @@ if __name__ == "__main__":
     })
     live_broker = LiveBroker(Config.EXCHANGE_NAME, Config.EXCHANGE_API_KEY, Config.EXCHANGE_SECRET)
 
-    # Create trader instance
     trader = MultiTrader(
         symbols=Config.SYMBOLS,
         initial_balance=Config.INITIAL_BALANCE,
@@ -777,16 +788,12 @@ if __name__ == "__main__":
     )
     trader_global = trader
 
-    # Start trading loop in background thread
     threading.Thread(target=trader.run_loop, daemon=True).start()
-
-    # Start Flask server in background thread
     threading.Thread(
         target=app.run,
         kwargs={'host': '0.0.0.0', 'port': int(os.getenv('PORT', 5000))},
         daemon=True
     ).start()
 
-    # Run Telegram bot on main thread
     logger.info("Starting Telegram bot on main thread...")
     run_telegram()
