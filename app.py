@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 Multi-Asset Consensus Trading Bot – KuCoin Edition (Final)
-- Runs Telegram on main thread (fixes signal handler error)
-- Trading loop and Flask run on background threads
+- Runs Telegram on main thread with its own event loop
+- Trading loop and Flask on background threads
 - Auto-validates symbols against KuCoin
 """
 
@@ -63,7 +63,6 @@ logger = logging.getLogger("multi-trader")
 
 # ---------------------------- KUCOIN SYMBOL VALIDATOR ----------------------------
 def get_kucoin_symbols() -> Set[str]:
-    """Fetch active trading pairs from KuCoin and return as a set of strings like 'BTC-USDT'."""
     try:
         resp = requests.get("https://api.kucoin.com/api/v2/symbols", timeout=10)
         if resp.status_code == 200:
@@ -209,7 +208,7 @@ class PerformanceLogger:
 # ---------------------------- MARKET DATA (KuCoin) ----------------------------
 class MarketData:
     def __init__(self, symbol):
-        self.symbol = symbol  # e.g., "BTC-USDT"
+        self.symbol = symbol
         self.base, self.quote = symbol.split('-')
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": "Mozilla/5.0"})
@@ -231,11 +230,7 @@ class MarketData:
             return None
 
     def get_ohlcv(self, limit=100, timeframe='1hour'):
-        params = {
-            "symbol": self.symbol,
-            "type": timeframe,
-            "limit": limit
-        }
+        params = {"symbol": self.symbol, "type": timeframe, "limit": limit}
         data = self._fetch_kucoin("/api/v1/market/candles", params)
         if not data:
             return None
@@ -244,11 +239,8 @@ class MarketData:
         for candle in data:
             try:
                 ohlcv.append([
-                    float(candle[1]),  # open
-                    float(candle[3]),  # high
-                    float(candle[4]),  # low
-                    float(candle[2]),  # close
-                    float(candle[5])   # volume
+                    float(candle[1]), float(candle[3]),
+                    float(candle[4]), float(candle[2]), float(candle[5])
                 ])
             except:
                 continue
@@ -468,10 +460,9 @@ class LiveBroker:
         logger.info(f"[LIVE] {side} {size} {symbol} at {price}")
         return {"status": "live_placeholder"}
 
-# ---------------------------- MULTI-ASSET TRADER (with symbol validation) ----------------------------
+# ---------------------------- MULTI-ASSET TRADER ----------------------------
 class MultiTrader:
     def __init__(self, symbols, initial_balance, risk_mgr, db, telegram_token, chat_id, live_broker):
-        # Validate symbols against KuCoin's active list
         valid_symbols = get_kucoin_symbols()
         if valid_symbols:
             self.symbols = [s for s in symbols if s in valid_symbols]
@@ -626,7 +617,7 @@ trader_global = None
 
 @app.route('/')
 def health():
-    return jsonify({"status": "running", "version": "kucoin-validator-final", "time": datetime.now().isoformat()})
+    return jsonify({"status": "running", "version": "final", "time": datetime.now().isoformat()})
 
 @app.route('/download')
 def download_csv():
@@ -742,11 +733,15 @@ async def handle_button(update: Update, context):
     elif text == "❓ Help":
         await help_cmd(update, context)
 
+# ---------------------------- MAIN ----------------------------
 def run_telegram():
-    """Run the Telegram bot (must be called from main thread)."""
+    """Run the Telegram bot (on main thread)."""
     if not Config.TELEGRAM_TOKEN:
         logger.warning("No Telegram token, skipping bot.")
         return
+    # Create an event loop and set it for this thread
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     app_tg = Application.builder().token(Config.TELEGRAM_TOKEN).build()
     app_tg.add_handler(CommandHandler("start", start))
     app_tg.add_handler(CommandHandler("help", help_cmd))
@@ -758,7 +753,6 @@ def run_telegram():
     app_tg.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_button))
     app_tg.run_polling()
 
-# ---------------------------- MAIN ----------------------------
 if __name__ == "__main__":
     # Initialize core components
     db = TradeDB(Config.DB_FILE)
@@ -783,23 +777,16 @@ if __name__ == "__main__":
     )
     trader_global = trader
 
-    # Start trading loop in a background thread
-    trading_thread = threading.Thread(target=trader.run_loop, daemon=True)
-    trading_thread.start()
+    # Start trading loop in background thread
+    threading.Thread(target=trader.run_loop, daemon=True).start()
 
-    # Start Flask server in a background thread
-    flask_thread = threading.Thread(
+    # Start Flask server in background thread
+    threading.Thread(
         target=app.run,
         kwargs={'host': '0.0.0.0', 'port': int(os.getenv('PORT', 5000))},
         daemon=True
-    )
-    flask_thread.start()
+    ).start()
 
-    # Run Telegram bot on the main thread (required for signal handling)
-    if Config.TELEGRAM_TOKEN:
-        logger.info("Starting Telegram bot on main thread...")
-        run_telegram()
-    else:
-        # If no Telegram token, keep main thread alive by joining trading thread
-        logger.warning("No Telegram token – main thread will keep running.")
-        trading_thread.join()
+    # Run Telegram bot on main thread
+    logger.info("Starting Telegram bot on main thread...")
+    run_telegram()
