@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 """
-Multi-Asset Consensus Trading Bot – KuCoin Edition (Symbols fixed)
-- Correct symbol format: BTC-USDT, ETH-USDT, etc.
-- MATIC replaced with POL (active KuCoin pair)
+Multi-Asset Consensus Trading Bot – KuCoin Edition (Slash-to-Dash auto-fix)
 """
 
 import os
@@ -25,8 +23,8 @@ load_dotenv()
 
 # ---------------------------- CONFIGURATION ----------------------------
 class Config:
-    # Updated symbols – use dash and active KuCoin pairs
-    SYMBOLS = [s.strip() for s in os.getenv("SYMBOLS", "BTC-USDT,ETH-USDT,SOL-USDT,AVAX-USDT,POL-USDT").split(',') if s.strip()]
+    # Auto-convert / to - so user can use either format
+    SYMBOLS = [s.strip().replace('/', '-') for s in os.getenv("SYMBOLS", "BTC-USDT,ETH-USDT,SOL-USDT,AVAX-USDT,POL-USDT").split(',') if s.strip()]
     INITIAL_BALANCE = float(os.getenv("INITIAL_BALANCE", "10000.0"))
     MAX_POSITIONS_GLOBAL = int(os.getenv("MAX_POSITIONS_GLOBAL", "5"))
     MAX_POSITIONS_PER_SYMBOL = int(os.getenv("MAX_POSITIONS_PER_SYMBOL", "1"))
@@ -49,8 +47,8 @@ class Config:
     SOURCE_WEIGHTS = {
         "technical_ma": float(os.getenv("WEIGHT_MA", "0.6")),
         "technical_rsi": float(os.getenv("WEIGHT_RSI", "0.4")),
-        "orderbook": float(os.getenv("WEIGHT_ORDERBOOK", "0.0")),   # disabled
-        "whale": float(os.getenv("WEIGHT_WHALE", "0.0")),           # disabled
+        "orderbook": float(os.getenv("WEIGHT_ORDERBOOK", "0.0")),
+        "whale": float(os.getenv("WEIGHT_WHALE", "0.0")),
         "sentiment": float(os.getenv("WEIGHT_SENTIMENT", "0.5")),
     }
 
@@ -196,7 +194,7 @@ class PerformanceLogger:
 class MarketData:
     def __init__(self, symbol):
         self.symbol = symbol  # e.g., "BTC-USDT"
-        self.base, self.quote = symbol.split('-')  # KuCoin uses dash
+        self.base, self.quote = symbol.split('-')
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": "Mozilla/5.0"})
 
@@ -218,14 +216,14 @@ class MarketData:
 
     def get_ohlcv(self, limit=100, timeframe='1hour'):
         params = {
-            "symbol": self.symbol,  # already dash format
+            "symbol": self.symbol,
             "type": timeframe,
             "limit": limit
         }
         data = self._fetch_kucoin("/api/v1/market/candles", params)
         if not data:
             return None
-        data = data[::-1]  # oldest first
+        data = data[::-1]
         ohlcv = []
         for candle in data:
             try:
@@ -243,10 +241,10 @@ class MarketData:
         return np.array(ohlcv)
 
     def get_orderbook(self, limit=20):
-        return [], []  # disabled
+        return [], []
 
     def get_recent_trades(self, limit=100):
-        return None  # disabled
+        return None
 
     def get_24h_change(self):
         params = {"symbol": self.symbol}
@@ -264,7 +262,7 @@ class MarketData:
         except:
             return 0, 0, 0
 
-# ---------------------------- SIGNAL SOURCES (MA, RSI, Sentiment) ----------------------------
+# ---------------------------- SIGNAL SOURCES ----------------------------
 class Signal:
     def __init__(self, direction, confidence, source, timestamp=None):
         self.direction = direction
