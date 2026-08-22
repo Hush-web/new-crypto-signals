@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Multi-Asset Consensus Trading Bot – KuCoin Edition (Slash-to-Dash auto-fix)
+Multi-Asset Consensus Trading Bot – KuCoin Edition (Auto-validate symbols)
 """
 
 import os
@@ -13,7 +13,7 @@ import asyncio
 import requests
 import numpy as np
 from datetime import datetime
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Set
 from dotenv import load_dotenv
 from flask import Flask, jsonify, send_file
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
@@ -23,7 +23,8 @@ load_dotenv()
 
 # ---------------------------- CONFIGURATION ----------------------------
 class Config:
-    # Auto-convert / to - so user can use either format
+    # These symbols will be validated against KuCoin's active list at startup.
+    # Use dash format, e.g., "BTC-USDT". Slashes are auto-converted.
     SYMBOLS = [s.strip().replace('/', '-') for s in os.getenv("SYMBOLS", "BTC-USDT,ETH-USDT,SOL-USDT,AVAX-USDT,POL-USDT").split(',') if s.strip()]
     INITIAL_BALANCE = float(os.getenv("INITIAL_BALANCE", "10000.0"))
     MAX_POSITIONS_GLOBAL = int(os.getenv("MAX_POSITIONS_GLOBAL", "5"))
@@ -58,6 +59,20 @@ logging.basicConfig(
     level=getattr(logging, Config.LOG_LEVEL)
 )
 logger = logging.getLogger("multi-trader")
+
+# ---------------------------- KUCOIN SYMBOL VALIDATOR ----------------------------
+def get_kucoin_symbols() -> Set[str]:
+    """Fetch active trading pairs from KuCoin and return as a set of strings like 'BTC-USDT'."""
+    try:
+        resp = requests.get("https://api.kucoin.com/api/v2/symbols", timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get('code') == '200000':
+                symbols = [s['symbol'] for s in data.get('data', []) if s.get('enableTrading') is True]
+                return set(symbols)
+    except Exception as e:
+        logger.error(f"Failed to fetch KuCoin symbols: {e}")
+    return set()
 
 # ---------------------------- DATABASE ----------------------------
 class TradeDB:
@@ -452,20 +467,34 @@ class LiveBroker:
         logger.info(f"[LIVE] {side} {size} {symbol} at {price}")
         return {"status": "live_placeholder"}
 
-# ---------------------------- MULTI-ASSET TRADER ----------------------------
+# ---------------------------- MULTI-ASSET TRADER (with symbol validation) ----------------------------
 class MultiTrader:
     def __init__(self, symbols, initial_balance, risk_mgr, db, telegram_token, chat_id, live_broker):
-        self.symbols = symbols
+        # Validate symbols against KuCoin's active list
+        valid_symbols = get_kucoin_symbols()
+        if valid_symbols:
+            self.symbols = [s for s in symbols if s in valid_symbols]
+            invalid = [s for s in symbols if s not in valid_symbols]
+            if invalid:
+                logger.warning(f"Skipping invalid symbols: {invalid}")
+            if not self.symbols:
+                logger.error("No valid symbols found. Falling back to defaults.")
+                self.symbols = ["BTC-USDT", "ETH-USDT", "SOL-USDT", "AVAX-USDT", "POL-USDT"]
+            logger.info(f"Active symbols: {self.symbols}")
+        else:
+            self.symbols = symbols
+            logger.warning("Could not fetch KuCoin symbols, using configured list.")
+
         self.db = db
         self.telegram_token = telegram_token
         self.chat_id = chat_id
         self.live_broker = live_broker
         self.risk_mgr = risk_mgr
         self.balance = initial_balance
-        self.markets = {sym: MarketData(sym) for sym in symbols}
+        self.markets = {sym: MarketData(sym) for sym in self.symbols}
         self.consensus = ConsensusEngine()
         self.sources = {}
-        for sym in symbols:
+        for sym in self.symbols:
             self.sources[sym] = [
                 MASource(self.markets[sym], db),
                 RSISource(self.markets[sym], db),
@@ -596,7 +625,7 @@ trader_global = None
 
 @app.route('/')
 def health():
-    return jsonify({"status": "running", "version": "kucoin-symbols-fixed", "time": datetime.now().isoformat()})
+    return jsonify({"status": "running", "version": "kucoin-validator", "time": datetime.now().isoformat()})
 
 @app.route('/download')
 def download_csv():
