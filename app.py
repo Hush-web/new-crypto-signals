@@ -1,30 +1,33 @@
 #!/usr/bin/env python3
 """
-Multi-Asset Consensus Trading Bot – Render Ready
-- No pandas (uses csv module)
-- Python 3.12 compatible
-- /download endpoint to fetch trades.csv
+Multi-Asset Consensus Trading Bot – Fully Fixed
+- ATR broadcast error fixed
+- Binance API robust handling
+- Telegram event loop fixed
+- CSV download endpoint
 """
 
 import os
 import time
-import json
 import csv
 import sqlite3
 import logging
 import threading
+import asyncio
 import requests
-from datetime import datetime
-from typing import Optional, List, Tuple, Dict, Any
 import numpy as np
+from datetime import datetime
+from typing import Optional, List, Tuple
 from dotenv import load_dotenv
-from flask import Flask, jsonify, send_file, send_from_directory
+from flask import Flask, jsonify, send_file
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 load_dotenv()
 
 # ---------------------------- CONFIGURATION ----------------------------
 class Config:
-    SYMBOLS = [s.strip() for s in os.getenv("SYMBOLS", "BTC/USDT,ETH/USDT,SOL/USDT,AVAX/USDT,MATIC/USDT,DOGE/USDT,ADA/USDT,DOT/USDT").split(',') if s.strip()]
+    SYMBOLS = [s.strip() for s in os.getenv("SYMBOLS", "BTC/USDT,ETH/USDT,SOL/USDT,AVAX/USDT,MATIC/USDT").split(',') if s.strip()]
     INITIAL_BALANCE = float(os.getenv("INITIAL_BALANCE", "10000.0"))
     MAX_POSITIONS_GLOBAL = int(os.getenv("MAX_POSITIONS_GLOBAL", "5"))
     MAX_POSITIONS_PER_SYMBOL = int(os.getenv("MAX_POSITIONS_PER_SYMBOL", "1"))
@@ -59,7 +62,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("multi-trader")
 
-# ---------------------------- DATABASE (SQLite) ----------------------------
+# ---------------------------- DATABASE ----------------------------
 class TradeDB:
     def __init__(self, db_file=Config.DB_FILE):
         self.conn = sqlite3.connect(db_file, check_same_thread=False)
@@ -106,15 +109,6 @@ class TradeDB:
             )
             self.conn.commit()
 
-    def get_trade_count_today(self):
-        today_start = int(datetime.now().replace(hour=0, minute=0, second=0).timestamp())
-        with self.lock:
-            self.cursor.execute(
-                "SELECT COUNT(*) FROM trades WHERE timestamp >= ? AND side IN ('buy','sell')",
-                (today_start,)
-            )
-            return self.cursor.fetchone()[0]
-
     def get_daily_pnl(self):
         today_start = int(datetime.now().replace(hour=0, minute=0, second=0).timestamp())
         with self.lock:
@@ -127,7 +121,7 @@ class TradeDB:
     def close(self):
         self.conn.close()
 
-# ---------------------------- CSV PERFORMANCE LOGGER (Pure CSV, No Pandas) ----------------------------
+# ---------------------------- CSV PERFORMANCE LOGGER ----------------------------
 class PerformanceLogger:
     def __init__(self, csv_file=Config.CSV_FILE):
         self.csv_file = csv_file
@@ -199,68 +193,80 @@ class PerformanceLogger:
             logger.error(f"CSV read error: {e}")
             return None
 
-# ---------------------------- MARKET DATA (FREE APIS) ----------------------------
+# ---------------------------- MARKET DATA (robust) ----------------------------
 class MarketData:
     def __init__(self, symbol):
         self.symbol = symbol
         self.base, self.quote = symbol.split('/')
+        self.session = requests.Session()
+        self.session.headers.update({"User-Agent": "Mozilla/5.0"})
+
+    def _fetch(self, endpoint, params, max_retries=2):
+        for attempt in range(max_retries):
+            try:
+                resp = self.session.get(endpoint, params=params, timeout=10)
+                if resp.status_code != 200:
+                    logger.error(f"Binance {endpoint} {self.symbol} status {resp.status_code}")
+                    time.sleep(2 ** attempt)
+                    continue
+                return resp.json()
+            except Exception:
+                time.sleep(2 ** attempt)
+        return None
 
     def get_ohlcv(self, limit=100, timeframe='1h'):
         endpoint = "https://api.binance.com/api/v3/klines"
         params = {"symbol": self.base+self.quote, "interval": timeframe, "limit": limit}
-        try:
-            resp = requests.get(endpoint, params=params, timeout=10)
-            data = resp.json()
-            # Convert to simple list for numpy processing (no pandas)
-            ohlcv = []
-            for candle in data:
-                ohlcv.append([
-                    float(candle[1]), float(candle[2]), float(candle[3]),
-                    float(candle[4]), float(candle[5])
-                ])
-            return np.array(ohlcv)
-        except Exception as e:
-            logger.error(f"OHLCV error for {self.symbol}: {e}")
+        data = self._fetch(endpoint, params)
+        if not isinstance(data, list) or len(data) < 14:
             return None
+        ohlcv = []
+        for candle in data:
+            try:
+                ohlcv.append([float(candle[1]), float(candle[2]), float(candle[3]),
+                              float(candle[4]), float(candle[5])])
+            except:
+                continue
+        return np.array(ohlcv) if len(ohlcv) >= 14 else None
 
     def get_orderbook(self, limit=20):
         endpoint = "https://api.binance.com/api/v3/depth"
         params = {"symbol": self.base+self.quote, "limit": limit}
+        data = self._fetch(endpoint, params)
+        if not data:
+            return [], []
         try:
-            resp = requests.get(endpoint, params=params, timeout=5)
-            data = resp.json()
             bids = [(float(p), float(q)) for p,q in data['bids'][:limit]]
             asks = [(float(p), float(q)) for p,q in data['asks'][:limit]]
             return bids, asks
-        except Exception as e:
-            logger.error(f"Orderbook error for {self.symbol}: {e}")
+        except:
             return [], []
 
     def get_recent_trades(self, limit=100):
         endpoint = "https://api.binance.com/api/v3/trades"
         params = {"symbol": self.base+self.quote, "limit": limit}
+        data = self._fetch(endpoint, params)
+        if not data:
+            return None
+        trades = []
         try:
-            resp = requests.get(endpoint, params=params, timeout=5)
-            data = resp.json()
-            trades = []
             for t in data:
                 trades.append({
                     'price': float(t['price']),
                     'qty': float(t['qty']),
-                    'time': t['time'],
                     'isBuyerMaker': t['isBuyerMaker']
                 })
             return trades
-        except Exception as e:
-            logger.error(f"Recent trades error for {self.symbol}: {e}")
+        except:
             return None
 
     def get_24h_change(self):
         endpoint = "https://api.binance.com/api/v3/ticker/24hr"
         params = {"symbol": self.base+self.quote}
+        data = self._fetch(endpoint, params)
+        if not data:
+            return 0, 0, 0
         try:
-            resp = requests.get(endpoint, params=params, timeout=5)
-            data = resp.json()
             change = float(data['priceChangePercent'])
             volume = float(data['quoteVolume'])
             if change > 2 and volume > 1_000_000:
@@ -268,8 +274,7 @@ class MarketData:
             elif change < -2 and volume > 1_000_000:
                 return -1, change, volume
             return 0, change, volume
-        except Exception as e:
-            logger.error(f"24h change error for {self.symbol}: {e}")
+        except:
             return 0, 0, 0
 
 # ---------------------------- SIGNAL CLASSES ----------------------------
@@ -292,13 +297,13 @@ class MASource(SignalSource):
         ohlcv = self.market.get_ohlcv(limit=100, timeframe='1h')
         if ohlcv is None or len(ohlcv) < 50:
             return None
-        close = ohlcv[:, 3]  # close is 4th column (index 3)
-        ma_short = np.mean(close[-20:])
-        ma_long = np.mean(close[-50:])
+        close = ohlcv[:, 3]
+        ma20 = np.mean(close[-20:])
+        ma50 = np.mean(close[-50:])
         price = close[-1]
-        if ma_short > ma_long and price > ma_short:
+        if ma20 > ma50 and price > ma20:
             return Signal(+1, 0.55, "technical_ma")
-        elif ma_short < ma_long and price < ma_short:
+        elif ma20 < ma50 and price < ma20:
             return Signal(-1, 0.55, "technical_ma")
         return Signal(0, 0.0, "technical_ma")
 
@@ -317,8 +322,7 @@ class RSISource(SignalSource):
         avg_loss = np.mean(losses[-14:]) if len(losses) >= 14 else np.mean(losses)
         if avg_loss == 0:
             return None
-        rs = avg_gain / avg_loss
-        rsi = 100 - (100 / (1 + rs))
+        rsi = 100 - (100 / (1 + avg_gain/avg_loss))
         if rsi < 30:
             return Signal(+1, 0.50, "technical_rsi")
         elif rsi > 70:
@@ -328,16 +332,14 @@ class RSISource(SignalSource):
 class OrderBookSource(SignalSource):
     def fetch(self):
         bids, asks = self.market.get_orderbook(limit=20)
-        if not bids or not asks or len(bids) < 1 or len(asks) < 1:
+        if not bids or not asks:
             return None
-        bid_price, bid_qty = bids[0]
-        ask_price, ask_qty = asks[0]
-        total_bid_vol = sum(qty for _, qty in bids[:10])
-        total_ask_vol = sum(qty for _, qty in asks[:10])
+        total_bid_vol = sum(q for _, q in bids[:10])
+        total_ask_vol = sum(q for _, q in asks[:10])
         if total_bid_vol == 0 or total_ask_vol == 0:
             return None
-        micro_price = (bid_price * total_ask_vol + ask_price * total_bid_vol) / (total_bid_vol + total_ask_vol)
-        mid_price = (bid_price + ask_price) / 2
+        micro_price = (bids[0][0]*total_ask_vol + asks[0][0]*total_bid_vol) / (total_bid_vol+total_ask_vol)
+        mid_price = (bids[0][0] + asks[0][0]) / 2
         if micro_price > mid_price * 1.002:
             return Signal(+1, 0.65, "orderbook")
         elif micro_price < mid_price * 0.998:
@@ -355,10 +357,8 @@ class WhaleSource(SignalSource):
         bids, asks = self.market.get_orderbook(1)
         if not bids or not asks:
             return None
-        current_price = (bids[0][0] + asks[0][0]) / 2
         for t in trades:
-            trade_usd = t['price'] * t['qty']
-            if trade_usd > self.threshold_usd:
+            if t['price'] * t['qty'] > self.threshold_usd:
                 if not t['isBuyerMaker']:
                     return Signal(+1, 0.70, "whale")
                 else:
@@ -367,7 +367,7 @@ class WhaleSource(SignalSource):
 
 class SentimentSource(SignalSource):
     def fetch(self):
-        score, change, volume = self.market.get_24h_change()
+        score, _, _ = self.market.get_24h_change()
         if score == 1:
             return Signal(+1, 0.55, "sentiment")
         elif score == -1:
@@ -397,7 +397,7 @@ class ConsensusEngine:
         direction = 1 if avg > self.threshold else (-1 if avg < -self.threshold else 0)
         return direction, abs(avg), details
 
-# ---------------------------- RISK MANAGER (with TP) ----------------------------
+# ---------------------------- RISK MANAGER ----------------------------
 class RiskManager:
     def __init__(self, initial_balance, config):
         self.initial_balance = initial_balance
@@ -421,11 +421,11 @@ class RiskManager:
     def can_trade(self, symbol):
         with self.lock:
             if self.daily_pnl < -self.config['MAX_DAILY_LOSS_PCT'] * self.initial_balance:
-                return False, f"Daily loss limit reached (${self.daily_pnl:.2f})"
+                return False, "Daily loss limit"
             if self.get_total_positions() >= self.config['MAX_POSITIONS_GLOBAL']:
-                return False, f"Global max positions ({self.config['MAX_POSITIONS_GLOBAL']})"
+                return False, "Global max positions"
             if self.open_positions.get(symbol, []) and len(self.open_positions[symbol]) >= self.config['MAX_POSITIONS_PER_SYMBOL']:
-                return False, f"Max per symbol ({self.config['MAX_POSITIONS_PER_SYMBOL']})"
+                return False, "Max per symbol"
             if self.consecutive_losses >= self.config['CONSECUTIVE_LOSS_LIMIT']:
                 return False, "Consecutive loss limit"
             return True, "OK"
@@ -436,8 +436,7 @@ class RiskManager:
             atr = price * 0.02
         stop_distance = atr * 2.5
         size = risk_amount / stop_distance
-        max_size = (balance * 0.5) / price
-        return min(size, max_size)
+        return min(size, (balance * 0.5) / price)
 
     def open_position(self, symbol, side, price, size, stop_loss, take_profit):
         with self.lock:
@@ -468,18 +467,14 @@ class RiskManager:
             for i, pos in enumerate(self.open_positions[symbol]):
                 if pos['side'] == 'buy':
                     if current_price <= pos['sl']:
-                        pnl, closed_pos = self.close_position(symbol, i, current_price)
-                        return pnl, 'SL', closed_pos
+                        return self.close_position(symbol, i, current_price) + ('SL',)
                     elif current_price >= pos['tp']:
-                        pnl, closed_pos = self.close_position(symbol, i, current_price)
-                        return pnl, 'TP', closed_pos
-                else:  # sell
+                        return self.close_position(symbol, i, current_price) + ('TP',)
+                else:
                     if current_price >= pos['sl']:
-                        pnl, closed_pos = self.close_position(symbol, i, current_price)
-                        return pnl, 'SL', closed_pos
+                        return self.close_position(symbol, i, current_price) + ('SL',)
                     elif current_price <= pos['tp']:
-                        pnl, closed_pos = self.close_position(symbol, i, current_price)
-                        return pnl, 'TP', closed_pos
+                        return self.close_position(symbol, i, current_price) + ('TP',)
             return 0, None, None
 
     def update_daily_pnl(self, pnl):
@@ -493,21 +488,18 @@ class RiskManager:
 # ---------------------------- LIVE BROKER (Placeholder) ----------------------------
 class LiveBroker:
     def __init__(self, exchange_name, api_key, secret):
-        self.exchange_name = exchange_name
-        self.api_key = api_key
-        self.secret = secret
         self.enabled = bool(exchange_name and api_key and secret)
         if self.enabled:
             logger.info(f"Live broker initialized for {exchange_name}")
         else:
             logger.info("Live broker disabled – paper trading only.")
 
-    def place_order(self, symbol, side, price, size, order_type='limit'):
+    def place_order(self, symbol, side, price, size):
         if not self.enabled:
-            logger.info(f"[PAPER] Would place {side} {size} {symbol} at {price}")
-            return {"status": "paper", "symbol": symbol, "side": side, "price": price, "size": size}
-        logger.info(f"[LIVE] Executing {side} {size} {symbol} at {price} on {self.exchange_name}")
-        return {"status": "live_placeholder", "symbol": symbol, "side": side, "price": price, "size": size}
+            logger.info(f"[PAPER] {side} {size:.4f} {symbol} @ ${price:.2f}")
+            return {"status": "paper"}
+        logger.info(f"[LIVE] {side} {size} {symbol} at {price}")
+        return {"status": "live_placeholder"}
 
 # ---------------------------- MULTI-ASSET TRADER ----------------------------
 class MultiTrader:
@@ -531,91 +523,74 @@ class MultiTrader:
                 SentimentSource(self.markets[sym], db)
             ]
         self.running = True
-        self.last_prices = {}
-        self.last_sentiment = {}
         self.performance_logger = PerformanceLogger(Config.CSV_FILE)
 
     def send_alert(self, message):
         if not self.telegram_token or not self.chat_id:
             return
-        url = f"https://api.telegram.org/bot{self.telegram_token}/sendMessage"
         try:
-            payload = {
-                "chat_id": self.chat_id,
-                "text": message,
-                "parse_mode": "HTML"
-            }
-            resp = requests.post(url, json=payload, timeout=30)
-            resp.raise_for_status()
+            requests.post(
+                f"https://api.telegram.org/bot{self.telegram_token}/sendMessage",
+                json={"chat_id": self.chat_id, "text": message, "parse_mode": "HTML"},
+                timeout=30
+            )
         except Exception as e:
             logger.error(f"Telegram send error: {e}")
 
     def get_price_and_atr(self, symbol):
         ohlcv = self.markets[symbol].get_ohlcv(limit=50, timeframe='1h')
-        if ohlcv is None or len(ohlcv) < 14:
+        if ohlcv is None or len(ohlcv) < 20:
             return None, None
         close = ohlcv[:, 3]
-        high = ohlcv[:, 2]
-        low = ohlcv[:, 3]  # we don't have low in our simple array? Actually we have high, low, close. We'll use simple ATR approximation.
-        # For simplicity, use high-low range from the array (we have high at index 2, low at index 3? Actually index: open=0, high=1, low=2, close=3, volume=4)
-        # Let's fix: we stored [open, high, low, close, volume]
         high = ohlcv[:, 1]
         low = ohlcv[:, 2]
-        tr = np.maximum(high - low, np.abs(high - np.roll(close, 1))[1:], np.abs(low - np.roll(close, 1))[1:])
-        atr = np.mean(tr[-14:])
-        price = close[-1]
-        return price, atr
+        # Align arrays correctly
+        high_curr = high[1:]
+        low_curr = low[1:]
+        prev_close = close[:-1]
+        tr1 = high_curr - low_curr
+        tr2 = np.abs(high_curr - prev_close)
+        tr3 = np.abs(low_curr - prev_close)
+        tr = np.maximum(tr1, np.maximum(tr2, tr3))
+        atr = np.mean(tr[-14:]) if len(tr) >= 14 else np.mean(tr)
+        return close[-1], atr
 
     def execute_signal(self, symbol, direction, confidence, price, atr, details, sentiment_score):
-        can_trade, reason = self.risk_mgr.can_trade(symbol)
+        can_trade, _ = self.risk_mgr.can_trade(symbol)
         if not can_trade:
-            logger.info(f"Risk block for {symbol}: {reason}")
             return
-
         size = self.risk_mgr.compute_position_size(self.balance, price, atr)
         if size <= 0:
             return
-
         risk = atr * 2.5
         stop_loss = price - risk if direction == 1 else price + risk
-        take_profit = price + (risk * 1.5) if direction == 1 else price - (risk * 1.5)
-
-        sl_pct = (risk / price) * 100
-        tp_pct = ((risk * 1.5) / price) * 100
-        risk_pct = self.risk_mgr.config['PER_TRADE_RISK_PCT'] * 100
-
-        sentiment_label = "🚀 Bullish" if sentiment_score == 1 else ("🔻 Bearish" if sentiment_score == -1 else "⚖️ Neutral")
+        take_profit = price + risk * 1.5 if direction == 1 else price - risk * 1.5
         side = 'buy' if direction == 1 else 'sell'
-        action_emoji = "🟢 BUY" if direction == 1 else "🔴 SELL"
-        live_tag = "LIVE" if self.live_broker.enabled else "PAPER"
-
-        if self.live_broker.enabled:
-            self.live_broker.place_order(symbol, side, price, size)
+        cost = price * size
+        if side == 'buy' and self.balance < cost:
+            self.send_alert(f"⚠️ Insufficient balance for {symbol}")
+            return
+        self.risk_mgr.open_position(symbol, side, price, size, stop_loss, take_profit)
+        if side == 'buy':
+            self.balance -= cost
         else:
-            cost = price * size
-            if side == 'buy' and self.balance < cost:
-                self.send_alert(f"⚠️ Insufficient balance for {symbol} buy")
-                return
-            self.risk_mgr.open_position(symbol, side, price, size, stop_loss, take_profit)
-            if side == 'buy':
-                self.balance -= cost
-            else:
-                self.balance += price * size
-            self.risk_mgr.update_balance(self.balance)
-            self.db.log_trade(int(time.time()), symbol, side, price, size, 0.0, 0.0, self.balance)
+            self.balance += price * size
+        self.risk_mgr.update_balance(self.balance)
+        self.db.log_trade(int(time.time()), symbol, side, price, size, 0.0, 0.0, self.balance)
 
         details_html = "<br>".join([f"• {d}" for d in details])
+        sentiment_label = "🚀 Bullish" if sentiment_score == 1 else ("🔻 Bearish" if sentiment_score == -1 else "⚖️ Neutral")
         msg = (
-            f"🔔 <b>{symbol} SIGNAL</b> ({live_tag})\n\n"
-            f"<b>Action:</b> {action_emoji}\n"
-            f"<b>Entry:</b> ${price:.4f}\n"
-            f"<b>Target (TP):</b> ${take_profit:.4f} (+{tp_pct:.2f}%)\n"
-            f"<b>Stop (SL):</b> ${stop_loss:.4f} (-{sl_pct:.2f}%)\n\n"
-            f"<b>Risk:</b> {risk_pct:.1f}% of portfolio\n"
-            f"<b>Confidence:</b> {confidence:.2f}\n"
-            f"<b>Sentiment:</b> {sentiment_label}\n\n"
-            f"<b>Strategy Votes:</b>\n{details_html}\n\n"
-            f"<i>Not financial advice. Trade at your own risk.</i>"
+            f"🔔 <b>{symbol} SIGNAL</b> ({'LIVE' if self.live_broker.enabled else 'PAPER'})\n"
+            f"Action: {'🟢 BUY' if direction==1 else '🔴 SELL'}\n"
+            f"Entry: ${price:.4f}\n"
+            f"TP: ${take_profit:.4f} (+{(risk*1.5/price)*100:.2f}%)\n"
+            f"SL: ${stop_loss:.4f} (-{(risk/price)*100:.2f}%)\n"
+            f"Risk: {self.risk_mgr.config['PER_TRADE_RISK_PCT']*100:.1f}%\n"
+            f"Confidence: {confidence:.2f}\n"
+            f"Sentiment: {sentiment_label}\n"
+            f"Votes:\n{details_html}\n\n"
+            f"<i>Not financial advice.</i>"
         )
         self.send_alert(msg)
 
@@ -624,8 +599,6 @@ class MultiTrader:
             price, atr = self.get_price_and_atr(symbol)
             if price is None or atr is None:
                 continue
-
-            # 1. Check SL / TP
             pnl, status, pos = self.risk_mgr.check_sl_tp(symbol, price)
             if pnl != 0 and pos is not None:
                 self.balance += pnl
@@ -633,49 +606,31 @@ class MultiTrader:
                 self.risk_mgr.update_daily_pnl(pnl)
                 pnl_pct = (pnl / (pos['entry'] * pos['size'])) * 100
                 self.performance_logger.log_trade(
-                    timestamp=int(time.time()),
-                    symbol=symbol,
-                    side=pos['side'],
-                    entry_price=pos['entry'],
-                    exit_price=price,
-                    size=pos['size'],
-                    pnl=pnl,
-                    pnl_pct=pnl_pct,
-                    status=status,
-                    balance_after=self.balance
+                    int(time.time()), symbol, pos['side'],
+                    pos['entry'], price, pos['size'],
+                    pnl, pnl_pct, status, self.balance
                 )
                 emoji = "✅" if pnl > 0 else "❌"
-                msg = (
-                    f"{emoji} <b>{symbol} POSITION CLOSED</b>\n"
-                    f"<b>Reason:</b> {status}\n"
-                    f"<b>Entry:</b> ${pos['entry']:.4f}\n"
-                    f"<b>Exit:</b> ${price:.4f}\n"
-                    f"<b>PnL:</b> ${pnl:.2f} ({pnl_pct:+.2f}%)\n"
-                    f"<b>Balance:</b> ${self.balance:.2f}"
+                self.send_alert(
+                    f"{emoji} <b>{symbol} CLOSED</b> ({status})\n"
+                    f"Entry: ${pos['entry']:.4f} | Exit: ${price:.4f}\n"
+                    f"PnL: ${pnl:.2f} ({pnl_pct:+.2f}%) | Balance: ${self.balance:.2f}"
                 )
-                self.send_alert(msg)
-
-            # 2. Skip if already in position
             if self.risk_mgr.open_positions.get(symbol, []):
                 continue
-
             signals = []
-            sentiment_score = 0
+            sentiment = 0
             for src in self.sources[symbol]:
                 sig = src.fetch()
                 if sig and sig.direction != 0:
                     signals.append(sig)
                     self.db.log_signal(int(time.time()), symbol, sig.source, sig.direction, sig.confidence)
                     if sig.source == "sentiment":
-                        sentiment_score = sig.direction
-
+                        sentiment = sig.direction
             if signals:
                 direction, conf, details = self.consensus.aggregate(signals)
                 if direction != 0 and conf >= Config.CONSENSUS_THRESHOLD:
-                    self.execute_signal(symbol, direction, conf, price, atr, details, sentiment_score)
-
-            self.last_prices[symbol] = price
-            self.last_sentiment[symbol] = sentiment_score
+                    self.execute_signal(symbol, direction, conf, price, atr, details, sentiment)
 
     def run_loop(self):
         logger.info("Starting multi-asset trading loop. Symbols: %s", self.symbols)
@@ -687,41 +642,32 @@ class MultiTrader:
                 logger.error(f"Loop error: {e}", exc_info=True)
                 time.sleep(Config.TRADE_INTERVAL_SECONDS)
 
-# ---------------------------- FLASK APP (with /download) ----------------------------
+# ---------------------------- FLASK APP ----------------------------
 app = Flask(__name__)
 trader_global = None
 
 @app.route('/')
 def health():
-    return jsonify({"status": "running", "version": "multi-asset", "time": datetime.now().isoformat()})
+    return jsonify({"status": "running", "version": "final", "time": datetime.now().isoformat()})
 
 @app.route('/download')
 def download_csv():
-    """Download the trades.csv file from Render."""
-    csv_file = Config.CSV_FILE
-    if os.path.exists(csv_file):
-        return send_file(csv_file, as_attachment=True, download_name="trades.csv")
-    else:
-        return jsonify({"error": "No trades.csv yet"}), 404
+    if os.path.exists(Config.CSV_FILE):
+        return send_file(Config.CSV_FILE, as_attachment=True, download_name="trades.csv")
+    return jsonify({"error": "No trades.csv yet"}), 404
 
 @app.route('/status')
 def status():
     if trader_global is None:
         return jsonify({"error": "trader not initialized"})
-    balance = trader_global.balance
-    daily_pnl = trader_global.db.get_daily_pnl()
-    total_pos = trader_global.risk_mgr.get_total_positions()
     return jsonify({
-        "balance": balance,
-        "daily_pnl": daily_pnl,
-        "open_positions_total": total_pos,
+        "balance": trader_global.balance,
+        "daily_pnl": trader_global.db.get_daily_pnl(),
+        "open_positions": trader_global.risk_mgr.get_total_positions(),
         "running": trader_global.running
     })
 
-# ---------------------------- TELEGRAM BOT HANDLERS (with Keyboard) ----------------------------
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
-
+# ---------------------------- TELEGRAM BOT ----------------------------
 def get_main_keyboard():
     buttons = [
         [KeyboardButton("📊 Status"), KeyboardButton("🔍 Scan")],
@@ -730,112 +676,80 @@ def get_main_keyboard():
     ]
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True, one_time_keyboard=False)
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = get_main_keyboard()
-    welcome_text = (
-        "🤖 <b>Welcome to Multi‑Asset Consensus Trader!</b>\n\n"
-        "I scan multiple coins using 5 independent strategies, "
-        "aggregate consensus, and execute paper trades with TP/SL.\n\n"
-        "Use the buttons below or type commands:\n"
-        "📊 /status – Account summary\n"
-        "🔍 /scan – Force signal scan\n"
-        "📈 /performance – Trade stats\n"
-        "⏸️ /pause – Pause trading\n"
-        "▶️ /resume – Resume trading\n"
-        "❓ /help – Show this menu\n\n"
-        "💾 <a href='https://your-bot.onrender.com/download'>Download CSV</a>\n\n"
-        "<i>Paper trading only. Not financial advice.</i>"
+async def start(update: Update, context):
+    await update.message.reply_text(
+        "🤖 <b>Consensus Trader</b>\n\nUse buttons or commands:\n"
+        "/status – Account\n/scan – Force scan\n/performance – Stats\n"
+        "/pause – Pause\n/resume – Resume\n/help – This\n\n"
+        "💾 <a href='https://new-crypto-signals.onrender.com/download'>Download CSV</a>",
+        parse_mode='HTML', reply_markup=get_main_keyboard(), disable_web_page_preview=True
     )
-    await update.message.reply_text(welcome_text, parse_mode='HTML', reply_markup=keyboard, disable_web_page_preview=True)
 
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = get_main_keyboard()
-    help_text = (
-        "📋 <b>Available Commands</b>\n\n"
-        "📊 /status – Show current balance, daily PnL, open positions\n"
-        "🔍 /scan – Manually scan all symbols for consensus signals\n"
-        "📈 /performance – Show trade win rate, total PnL, best/worst\n"
-        "⏸️ /pause – Pause the trading loop\n"
-        "▶️ /resume – Resume trading\n"
-        "❓ /help – Show this menu\n\n"
-        "💾 Download your trade history at:\n"
-        "<code>https://your-bot.onrender.com/download</code>\n\n"
-        "💡 You can also use the buttons below."
-    )
-    await update.message.reply_text(help_text, parse_mode='HTML', reply_markup=keyboard)
+async def help_cmd(update: Update, context):
+    await update.message.reply_text("Commands: /status, /scan, /performance, /pause, /resume, /help", reply_markup=get_main_keyboard())
 
-async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def status_cmd(update: Update, context):
     if trader_global is None:
-        await update.message.reply_text("Trader not initialized yet.", reply_markup=get_main_keyboard())
+        await update.message.reply_text("Trader not ready.", reply_markup=get_main_keyboard())
         return
-    trader = trader_global
-    balance = trader.balance
-    daily_pnl = trader.db.get_daily_pnl()
-    total_pos = trader.risk_mgr.get_total_positions()
-    running = trader.running
-    msg = (f"📊 <b>ACCOUNT STATUS</b>\n"
-           f"💰 Balance: ${balance:.2f}\n"
-           f"📉 Daily PnL: ${daily_pnl:.2f}\n"
-           f"📌 Open Positions: {total_pos}\n"
-           f"⏳ Running: {'✅' if running else '⏸️'}")
-    await update.message.reply_text(msg, parse_mode='HTML', reply_markup=get_main_keyboard())
+    t = trader_global
+    await update.message.reply_text(
+        f"📊 <b>Status</b>\nBalance: ${t.balance:.2f}\nDaily PnL: ${t.db.get_daily_pnl():.2f}\n"
+        f"Open Positions: {t.risk_mgr.get_total_positions()}\nRunning: {'✅' if t.running else '⏸️'}",
+        parse_mode='HTML', reply_markup=get_main_keyboard()
+    )
 
-async def performance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def performance(update: Update, context):
     if trader_global is None:
-        await update.message.reply_text("Trader not initialized yet.", reply_markup=get_main_keyboard())
+        await update.message.reply_text("Trader not ready.", reply_markup=get_main_keyboard())
         return
     summary = trader_global.performance_logger.get_summary()
-    if summary is None:
-        await update.message.reply_text("No trades recorded yet.", reply_markup=get_main_keyboard())
+    if not summary:
+        await update.message.reply_text("No trades yet.", reply_markup=get_main_keyboard())
         return
-    msg = (f"📈 <b>PERFORMANCE SUMMARY</b>\n"
-           f"📊 Total Trades: {summary['total_trades']}\n"
-           f"🏆 Win Rate: {summary['win_rate']:.1f}%\n"
-           f"💰 Total PnL: ${summary['total_pnl']:.2f}\n"
-           f"📈 Avg Win: ${summary['avg_win']:.2f}\n"
-           f"📉 Avg Loss: ${summary['avg_loss']:.2f}\n"
-           f"🌟 Best Trade: ${summary['best_trade']:.2f}\n"
-           f"💀 Worst Trade: ${summary['worst_trade']:.2f}\n"
-           f"💵 Current Balance: ${summary['current_balance']:.2f}")
-    await update.message.reply_text(msg, parse_mode='HTML', reply_markup=get_main_keyboard())
+    await update.message.reply_text(
+        f"📈 <b>Performance</b>\nTrades: {summary['total_trades']}\nWin Rate: {summary['win_rate']:.1f}%\n"
+        f"Total PnL: ${summary['total_pnl']:.2f}\nAvg Win: ${summary['avg_win']:.2f}\n"
+        f"Avg Loss: ${summary['avg_loss']:.2f}\nBest: ${summary['best_trade']:.2f}\n"
+        f"Worst: ${summary['worst_trade']:.2f}\nBalance: ${summary['current_balance']:.2f}",
+        parse_mode='HTML', reply_markup=get_main_keyboard()
+    )
 
-async def scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🔍 Scanning all symbols for signals...", reply_markup=get_main_keyboard())
+async def scan(update: Update, context):
+    await update.message.reply_text("🔍 Scanning...", reply_markup=get_main_keyboard())
     if trader_global is None:
-        await update.message.reply_text("Trader not initialized.", reply_markup=get_main_keyboard())
         return
-    trader = trader_global
-    for symbol in trader.symbols:
-        price, atr = trader.get_price_and_atr(symbol)
+    for sym in trader_global.symbols:
+        price, atr = trader_global.get_price_and_atr(sym)
         if price is None:
+            await update.message.reply_text(f"⚠️ No data for {sym}")
             continue
         signals = []
-        for src in trader.sources[symbol]:
+        for src in trader_global.sources[sym]:
             sig = src.fetch()
             if sig and sig.direction != 0:
                 signals.append(sig)
         if signals:
-            direction, conf, details = trader.consensus.aggregate(signals)
-            detail_str = " | ".join(details)
-            msg = (f"⚖️ {symbol} Consensus: {'BUY' if direction==1 else 'SELL' if direction==-1 else 'NEUTRAL'}\n"
-                   f"📊 Conf: {conf:.2f}\n"
-                   f"📋 Sources: {detail_str}")
-            await update.message.reply_text(msg, reply_markup=get_main_keyboard())
+            direction, conf, details = trader_global.consensus.aggregate(signals)
+            await update.message.reply_text(
+                f"⚖️ {sym}: {'BUY' if direction==1 else 'SELL' if direction==-1 else 'NEUTRAL'}\n"
+                f"Confidence: {conf:.2f}\nSources: {' | '.join(details)}"
+            )
         else:
-            await update.message.reply_text(f"⚠️ No signals for {symbol}", reply_markup=get_main_keyboard())
+            await update.message.reply_text(f"⚠️ No signals for {sym}")
     await update.message.reply_text("✅ Scan complete.", reply_markup=get_main_keyboard())
 
-async def pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if trader_global is not None:
+async def pause(update: Update, context):
+    if trader_global:
         trader_global.running = False
-    await update.message.reply_text("⏸️ Trading paused.", reply_markup=get_main_keyboard())
+    await update.message.reply_text("⏸️ Paused.", reply_markup=get_main_keyboard())
 
-async def resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if trader_global is not None:
+async def resume(update: Update, context):
+    if trader_global:
         trader_global.running = True
-    await update.message.reply_text("▶️ Trading resumed.", reply_markup=get_main_keyboard())
+    await update.message.reply_text("▶️ Resumed.", reply_markup=get_main_keyboard())
 
-async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_button(update: Update, context):
     text = update.message.text
     if text == "📊 Status":
         await status_cmd(update, context)
@@ -850,7 +764,23 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif text == "❓ Help":
         await help_cmd(update, context)
 
-# ---------------------------- MAIN ENTRY ----------------------------
+def run_telegram():
+    if not Config.TELEGRAM_TOKEN:
+        return
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    app_tg = Application.builder().token(Config.TELEGRAM_TOKEN).build()
+    app_tg.add_handler(CommandHandler("start", start))
+    app_tg.add_handler(CommandHandler("help", help_cmd))
+    app_tg.add_handler(CommandHandler("status", status_cmd))
+    app_tg.add_handler(CommandHandler("performance", performance))
+    app_tg.add_handler(CommandHandler("scan", scan))
+    app_tg.add_handler(CommandHandler("pause", pause))
+    app_tg.add_handler(CommandHandler("resume", resume))
+    app_tg.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_button))
+    app_tg.run_polling()
+
+# ---------------------------- MAIN ----------------------------
 if __name__ == "__main__":
     # Flask
     flask_thread = threading.Thread(target=app.run, kwargs={'host':'0.0.0.0', 'port':int(os.getenv('PORT', 5000))})
@@ -858,23 +788,11 @@ if __name__ == "__main__":
     flask_thread.start()
 
     # Telegram
-    telegram_app = None
-    if Config.TELEGRAM_TOKEN and Config.TELEGRAM_CHAT_ID:
-        telegram_app = Application.builder().token(Config.TELEGRAM_TOKEN).build()
-        telegram_app.add_handler(CommandHandler("start", start))
-        telegram_app.add_handler(CommandHandler("help", help_cmd))
-        telegram_app.add_handler(CommandHandler("status", status_cmd))
-        telegram_app.add_handler(CommandHandler("performance", performance))
-        telegram_app.add_handler(CommandHandler("scan", scan))
-        telegram_app.add_handler(CommandHandler("pause", pause))
-        telegram_app.add_handler(CommandHandler("resume", resume))
-        telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_button))
-        tg_thread = threading.Thread(target=lambda: telegram_app.run_polling())
+    if Config.TELEGRAM_TOKEN:
+        tg_thread = threading.Thread(target=run_telegram)
         tg_thread.daemon = True
         tg_thread.start()
-        logger.info("Telegram bot started with keyboard.")
-    else:
-        logger.warning("Telegram token or chat ID not set. Bot will run without alerts.")
+        logger.info("Telegram bot started.")
 
     # Live broker
     live_broker = LiveBroker(Config.EXCHANGE_NAME, Config.EXCHANGE_API_KEY, Config.EXCHANGE_SECRET)
@@ -889,7 +807,6 @@ if __name__ == "__main__":
         'PER_TRADE_RISK_PCT': Config.PER_TRADE_RISK_PCT,
     })
 
-    # Trader
     trader = MultiTrader(
         symbols=Config.SYMBOLS,
         initial_balance=Config.INITIAL_BALANCE,
@@ -900,5 +817,4 @@ if __name__ == "__main__":
         live_broker=live_broker
     )
     trader_global = trader
-
     trader.run_loop()
