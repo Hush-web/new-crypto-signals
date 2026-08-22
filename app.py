@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
 """
-Multi-Asset Consensus Trading Bot – Fully Fixed
-- HTML Telegram messages (no Markdown parse errors)
-- Synchronous requests for Telegram (no event loop conflicts)
-- TP/SL execution + CSV logging
-- Reply keyboard with buttons
-- Orderbook empty guard
-- No risk-block alerts
+Multi-Asset Consensus Trading Bot – Render Ready
+- No pandas (uses csv module)
+- Python 3.12 compatible
+- /download endpoint to fetch trades.csv
 """
 
 import os
@@ -19,12 +16,9 @@ import threading
 import requests
 from datetime import datetime
 from typing import Optional, List, Tuple, Dict, Any
-import pandas as pd
 import numpy as np
 from dotenv import load_dotenv
-from flask import Flask, jsonify
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from flask import Flask, jsonify, send_file, send_from_directory
 
 load_dotenv()
 
@@ -133,7 +127,7 @@ class TradeDB:
     def close(self):
         self.conn.close()
 
-# ---------------------------- CSV PERFORMANCE LOGGER ----------------------------
+# ---------------------------- CSV PERFORMANCE LOGGER (Pure CSV, No Pandas) ----------------------------
 class PerformanceLogger:
     def __init__(self, csv_file=Config.CSV_FILE):
         self.csv_file = csv_file
@@ -159,27 +153,47 @@ class PerformanceLogger:
         if not os.path.isfile(self.csv_file):
             return None
         try:
-            df = pd.read_csv(self.csv_file)
-            if df.empty:
+            rows = []
+            with open(self.csv_file, mode='r', newline='') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    rows.append(row)
+            if not rows:
                 return None
-            total_trades = len(df)
-            wins = df[df['pnl'] > 0]
-            losses = df[df['pnl'] < 0]
-            win_rate = len(wins) / total_trades * 100 if total_trades > 0 else 0
-            total_pnl = df['pnl'].sum()
-            avg_win = wins['pnl'].mean() if not wins.empty else 0
-            avg_loss = losses['pnl'].mean() if not losses.empty else 0
-            best_trade = df['pnl'].max()
-            worst_trade = df['pnl'].min()
+            total_trades = len(rows)
+            pnl_sum = 0.0
+            wins = 0
+            losses = 0
+            win_pnls = []
+            loss_pnls = []
+            best = -1e9
+            worst = 1e9
+            for r in rows:
+                pnl = float(r['pnl'])
+                pnl_sum += pnl
+                if pnl > 0:
+                    wins += 1
+                    win_pnls.append(pnl)
+                elif pnl < 0:
+                    losses += 1
+                    loss_pnls.append(pnl)
+                if pnl > best:
+                    best = pnl
+                if pnl < worst:
+                    worst = pnl
+            win_rate = (wins / total_trades) * 100 if total_trades > 0 else 0
+            avg_win = sum(win_pnls) / len(win_pnls) if win_pnls else 0
+            avg_loss = sum(loss_pnls) / len(loss_pnls) if loss_pnls else 0
+            last_balance = float(rows[-1]['balance_after']) if rows else 0
             return {
                 'total_trades': total_trades,
                 'win_rate': win_rate,
-                'total_pnl': total_pnl,
+                'total_pnl': pnl_sum,
                 'avg_win': avg_win,
                 'avg_loss': avg_loss,
-                'best_trade': best_trade,
-                'worst_trade': worst_trade,
-                'current_balance': df.iloc[-1]['balance_after'] if not df.empty else 0
+                'best_trade': best if best != -1e9 else 0,
+                'worst_trade': worst if worst != 1e9 else 0,
+                'current_balance': last_balance
             }
         except Exception as e:
             logger.error(f"CSV read error: {e}")
@@ -197,12 +211,14 @@ class MarketData:
         try:
             resp = requests.get(endpoint, params=params, timeout=10)
             data = resp.json()
-            df = pd.DataFrame(data, columns=['timestamp','open','high','low','close','volume','close_time',
-                                             'quote_asset_volume','number_of_trades','taker_buy_base_asset_volume',
-                                             'taker_buy_quote_asset_volume','ignore'])
-            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-            df[['open','high','low','close','volume']] = df[['open','high','low','close','volume']].astype(float)
-            return df
+            # Convert to simple list for numpy processing (no pandas)
+            ohlcv = []
+            for candle in data:
+                ohlcv.append([
+                    float(candle[1]), float(candle[2]), float(candle[3]),
+                    float(candle[4]), float(candle[5])
+                ])
+            return np.array(ohlcv)
         except Exception as e:
             logger.error(f"OHLCV error for {self.symbol}: {e}")
             return None
@@ -273,15 +289,13 @@ class SignalSource:
 
 class MASource(SignalSource):
     def fetch(self):
-        df = self.market.get_ohlcv(limit=100, timeframe='1h')
-        if df is None or len(df) < 50:
+        ohlcv = self.market.get_ohlcv(limit=100, timeframe='1h')
+        if ohlcv is None or len(ohlcv) < 50:
             return None
-        close = df['close']
-        ma_short = close.rolling(20).mean().iloc[-1]
-        ma_long = close.rolling(50).mean().iloc[-1]
-        price = close.iloc[-1]
-        if pd.isna(ma_short) or pd.isna(ma_long):
-            return None
+        close = ohlcv[:, 3]  # close is 4th column (index 3)
+        ma_short = np.mean(close[-20:])
+        ma_long = np.mean(close[-50:])
+        price = close[-1]
         if ma_short > ma_long and price > ma_short:
             return Signal(+1, 0.55, "technical_ma")
         elif ma_short < ma_long and price < ma_short:
@@ -290,23 +304,24 @@ class MASource(SignalSource):
 
 class RSISource(SignalSource):
     def fetch(self):
-        df = self.market.get_ohlcv(limit=100, timeframe='1h')
-        if df is None:
+        ohlcv = self.market.get_ohlcv(limit=100, timeframe='1h')
+        if ohlcv is None or len(ohlcv) < 20:
             return None
-        close = df['close']
-        delta = close.diff()
-        gain = (delta.where(delta > 0, 0)).rolling(14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-        if loss.iloc[-1] == 0:
+        close = ohlcv[:, 3]
+        deltas = np.diff(close)
+        gains = deltas[deltas > 0]
+        losses = -deltas[deltas < 0]
+        if len(gains) == 0 or len(losses) == 0:
             return None
-        rs = gain / loss
+        avg_gain = np.mean(gains[-14:]) if len(gains) >= 14 else np.mean(gains)
+        avg_loss = np.mean(losses[-14:]) if len(losses) >= 14 else np.mean(losses)
+        if avg_loss == 0:
+            return None
+        rs = avg_gain / avg_loss
         rsi = 100 - (100 / (1 + rs))
-        last_rsi = rsi.iloc[-1]
-        if pd.isna(last_rsi):
-            return None
-        if last_rsi < 30:
+        if rsi < 30:
             return Signal(+1, 0.50, "technical_rsi")
-        elif last_rsi > 70:
+        elif rsi > 70:
             return Signal(-1, 0.50, "technical_rsi")
         return Signal(0, 0.0, "technical_rsi")
 
@@ -494,7 +509,7 @@ class LiveBroker:
         logger.info(f"[LIVE] Executing {side} {size} {symbol} at {price} on {self.exchange_name}")
         return {"status": "live_placeholder", "symbol": symbol, "side": side, "price": price, "size": size}
 
-# ---------------------------- MULTI-ASSET TRADER (with synchronous Telegram) ----------------------------
+# ---------------------------- MULTI-ASSET TRADER ----------------------------
 class MultiTrader:
     def __init__(self, symbols, initial_balance, risk_mgr, db, telegram_token, chat_id, live_broker):
         self.symbols = symbols
@@ -520,7 +535,6 @@ class MultiTrader:
         self.last_sentiment = {}
         self.performance_logger = PerformanceLogger(Config.CSV_FILE)
 
-    # ---- Synchronous Telegram send via requests ----
     def send_alert(self, message):
         if not self.telegram_token or not self.chat_id:
             return
@@ -537,18 +551,19 @@ class MultiTrader:
             logger.error(f"Telegram send error: {e}")
 
     def get_price_and_atr(self, symbol):
-        df = self.markets[symbol].get_ohlcv(limit=50, timeframe='1h')
-        if df is None or len(df) < 14:
+        ohlcv = self.markets[symbol].get_ohlcv(limit=50, timeframe='1h')
+        if ohlcv is None or len(ohlcv) < 14:
             return None, None
-        close = df['close']
-        high = df['high']
-        low = df['low']
-        tr1 = high - low
-        tr2 = abs(high - close.shift())
-        tr3 = abs(low - close.shift())
-        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-        atr = tr.rolling(14).mean().iloc[-1]
-        price = close.iloc[-1]
+        close = ohlcv[:, 3]
+        high = ohlcv[:, 2]
+        low = ohlcv[:, 3]  # we don't have low in our simple array? Actually we have high, low, close. We'll use simple ATR approximation.
+        # For simplicity, use high-low range from the array (we have high at index 2, low at index 3? Actually index: open=0, high=1, low=2, close=3, volume=4)
+        # Let's fix: we stored [open, high, low, close, volume]
+        high = ohlcv[:, 1]
+        low = ohlcv[:, 2]
+        tr = np.maximum(high - low, np.abs(high - np.roll(close, 1))[1:], np.abs(low - np.roll(close, 1))[1:])
+        atr = np.mean(tr[-14:])
+        price = close[-1]
         return price, atr
 
     def execute_signal(self, symbol, direction, confidence, price, atr, details, sentiment_score):
@@ -672,13 +687,22 @@ class MultiTrader:
                 logger.error(f"Loop error: {e}", exc_info=True)
                 time.sleep(Config.TRADE_INTERVAL_SECONDS)
 
-# ---------------------------- FLASK APP ----------------------------
+# ---------------------------- FLASK APP (with /download) ----------------------------
 app = Flask(__name__)
-trader_global = None  # will be set in main
+trader_global = None
 
 @app.route('/')
 def health():
     return jsonify({"status": "running", "version": "multi-asset", "time": datetime.now().isoformat()})
+
+@app.route('/download')
+def download_csv():
+    """Download the trades.csv file from Render."""
+    csv_file = Config.CSV_FILE
+    if os.path.exists(csv_file):
+        return send_file(csv_file, as_attachment=True, download_name="trades.csv")
+    else:
+        return jsonify({"error": "No trades.csv yet"}), 404
 
 @app.route('/status')
 def status():
@@ -694,7 +718,10 @@ def status():
         "running": trader_global.running
     })
 
-# ---------------------------- TELEGRAM BOT HANDLERS ----------------------------
+# ---------------------------- TELEGRAM BOT HANDLERS (with Keyboard) ----------------------------
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+
 def get_main_keyboard():
     buttons = [
         [KeyboardButton("📊 Status"), KeyboardButton("🔍 Scan")],
@@ -716,9 +743,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "⏸️ /pause – Pause trading\n"
         "▶️ /resume – Resume trading\n"
         "❓ /help – Show this menu\n\n"
+        "💾 <a href='https://your-bot.onrender.com/download'>Download CSV</a>\n\n"
         "<i>Paper trading only. Not financial advice.</i>"
     )
-    await update.message.reply_text(welcome_text, parse_mode='HTML', reply_markup=keyboard)
+    await update.message.reply_text(welcome_text, parse_mode='HTML', reply_markup=keyboard, disable_web_page_preview=True)
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = get_main_keyboard()
@@ -730,6 +758,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "⏸️ /pause – Pause the trading loop\n"
         "▶️ /resume – Resume trading\n"
         "❓ /help – Show this menu\n\n"
+        "💾 Download your trade history at:\n"
+        "<code>https://your-bot.onrender.com/download</code>\n\n"
         "💡 You can also use the buttons below."
     )
     await update.message.reply_text(help_text, parse_mode='HTML', reply_markup=keyboard)
@@ -827,7 +857,7 @@ if __name__ == "__main__":
     flask_thread.daemon = True
     flask_thread.start()
 
-    # Telegram (only for command handling, we'll use direct HTTP for alerts)
+    # Telegram
     telegram_app = None
     if Config.TELEGRAM_TOKEN and Config.TELEGRAM_CHAT_ID:
         telegram_app = Application.builder().token(Config.TELEGRAM_TOKEN).build()
