@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Multi-Asset Consensus Trading Bot – Complete Version with Telegram Auto-Restart
+Multi-Asset Consensus Trading Bot – Final Stable (Telegram in thread + keep-alive)
 """
 
 import os
@@ -31,10 +31,10 @@ class Config:
     PER_TRADE_RISK_PCT = float(os.getenv("PER_TRADE_RISK_PCT", "0.02"))
     MAX_DAILY_LOSS_PCT = float(os.getenv("MAX_DAILY_LOSS_PCT", "0.05"))
     MAX_DRAWDOWN = float(os.getenv("MAX_DRAWDOWN", "0.10"))
-    CONSENSUS_THRESHOLD = float(os.getenv("CONSENSUS_THRESHOLD", "0.60"))
-    MIN_SOURCES = int(os.getenv("MIN_SOURCES", "1"))
+    CONSENSUS_THRESHOLD = float(os.getenv("CONSENSUS_THRESHOLD", "0.50"))
+    MIN_SOURCES = int(os.getenv("MIN_SOURCES", "2"))
     CONSECUTIVE_LOSS_LIMIT = int(os.getenv("CONSECUTIVE_LOSS_LIMIT", "3"))
-    VOLATILITY_MIN = float(os.getenv("VOLATILITY_MIN", "0.02"))
+    VOLATILITY_MIN = float(os.getenv("VOLATILITY_MIN", "0.01"))
     TREND_FILTER = os.getenv("TREND_FILTER", "true").lower() == "true"
     TREND_MA_PERIOD = int(os.getenv("TREND_MA_PERIOD", "200"))
     TRADE_INTERVAL_SECONDS = int(os.getenv("TRADE_INTERVAL_SECONDS", "60"))
@@ -146,13 +146,6 @@ class TradeDB:
             self.cursor.execute(
                 "SELECT COALESCE(SUM(pnl), 0) FROM trades WHERE timestamp >= ?",
                 (today_start,)
-            )
-            return self.cursor.fetchone()[0]
-
-    def get_total_pnl(self):
-        with self.lock:
-            self.cursor.execute(
-                "SELECT COALESCE(SUM(pnl), 0) FROM trades WHERE side IN ('buy','sell')"
             )
             return self.cursor.fetchone()[0]
 
@@ -843,7 +836,7 @@ trader_global = None
 
 @app.route('/')
 def health():
-    return jsonify({"status": "running", "version": "final-auto-restart", "time": datetime.now().isoformat()})
+    return jsonify({"status": "running", "version": "final-stable", "time": datetime.now().isoformat()})
 
 @app.route('/download')
 def download_csv():
@@ -873,11 +866,12 @@ def get_main_keyboard():
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True, one_time_keyboard=False)
 
 async def start(update: Update, context):
+    logger.info(f"Received /start from {update.effective_user.id}")
     await update.message.reply_text(
-        "🤖 <b>Consensus Trader (Complete)</b>\n\n"
+        "🤖 <b>Consensus Trader</b>\n\n"
         "Commands:\n"
         "/status – Account\n/scan – Force scan\n/performance – Stats\n"
-        "/backtest <symbol> – Run backtest (e.g., /backtest BTC-USDT)\n"
+        "/backtest <symbol> – Run backtest\n"
         "/pause – Pause\n/resume – Resume\n/help – This\n\n"
         "💾 <a href='https://new-crypto-signals.onrender.com/download'>Download CSV</a>",
         parse_mode='HTML', reply_markup=get_main_keyboard(), disable_web_page_preview=True
@@ -887,6 +881,7 @@ async def help_cmd(update: Update, context):
     await update.message.reply_text("Commands: /status, /scan, /performance, /backtest, /pause, /resume, /help", reply_markup=get_main_keyboard())
 
 async def status_cmd(update: Update, context):
+    logger.info(f"Received /status from {update.effective_user.id}")
     if trader_global is None:
         await update.message.reply_text("Trader not ready.", reply_markup=get_main_keyboard())
         return
@@ -901,6 +896,7 @@ async def status_cmd(update: Update, context):
     await update.message.reply_text(safe_msg, parse_mode='HTML', reply_markup=get_main_keyboard())
 
 async def performance(update: Update, context):
+    logger.info(f"Received /performance from {update.effective_user.id}")
     if trader_global is None:
         await update.message.reply_text("Trader not ready.", reply_markup=get_main_keyboard())
         return
@@ -925,6 +921,7 @@ async def performance(update: Update, context):
     await update.message.reply_text(safe_msg, parse_mode='HTML', reply_markup=get_main_keyboard())
 
 async def backtest(update: Update, context):
+    logger.info(f"Received /backtest from {update.effective_user.id}")
     if trader_global is None:
         await update.message.reply_text("Trader not ready.", reply_markup=get_main_keyboard())
         return
@@ -936,9 +933,9 @@ async def backtest(update: Update, context):
     if '-' not in symbol:
         symbol = symbol.replace('/', '-')
     if symbol not in trader_global.symbols:
-        await update.message.reply_text(f"Symbol {symbol} not in active list. Active: {', '.join(trader_global.symbols)}", reply_markup=get_main_keyboard())
+        await update.message.reply_text(f"Symbol {symbol} not active. Active: {', '.join(trader_global.symbols)}", reply_markup=get_main_keyboard())
         return
-    await update.message.reply_text(f"⏳ Running backtest for {symbol} (may take a moment)...", reply_markup=get_main_keyboard())
+    await update.message.reply_text(f"⏳ Running backtest for {symbol}...", reply_markup=get_main_keyboard())
     try:
         result = trader_global.backtest(symbol, lookback_days=30, timeframe='1hour')
         if isinstance(result, str):
@@ -958,9 +955,10 @@ async def backtest(update: Update, context):
             safe_msg = sanitize_html(msg)
             await update.message.reply_text(safe_msg, parse_mode='HTML', reply_markup=get_main_keyboard())
     except Exception as e:
-        await update.message.reply_text(f"Error in backtest: {e}", reply_markup=get_main_keyboard())
+        await update.message.reply_text(f"Backtest error: {e}", reply_markup=get_main_keyboard())
 
 async def scan(update: Update, context):
+    logger.info(f"Received /scan from {update.effective_user.id}")
     await update.message.reply_text("🔍 Scanning...", reply_markup=get_main_keyboard())
     if trader_global is None:
         return
@@ -1004,6 +1002,7 @@ async def resume(update: Update, context):
 
 async def handle_button(update: Update, context):
     text = update.message.text
+    logger.info(f"Button pressed: {text}")
     if text == "📊 Status":
         await status_cmd(update, context)
     elif text == "🔍 Scan":
@@ -1017,9 +1016,9 @@ async def handle_button(update: Update, context):
     elif text == "❓ Help":
         await help_cmd(update, context)
 
-# ---------------------------- MAIN (with Telegram auto-restart) ----------------------------
+# ---------------------------- MAIN ----------------------------
 def run_telegram():
-    """Run Telegram bot with infinite retry loop."""
+    """Run Telegram bot in a separate thread with its own event loop."""
     if not Config.TELEGRAM_TOKEN:
         logger.warning("No Telegram token, skipping bot.")
         return
@@ -1078,6 +1077,12 @@ if __name__ == "__main__":
         daemon=True
     ).start()
 
-    # Run Telegram bot on main thread (with infinite restart loop)
-    logger.info("Starting Telegram bot on main thread...")
-    run_telegram()
+    # Run Telegram bot in its own thread (with restart loop)
+    telegram_thread = threading.Thread(target=run_telegram, daemon=False)
+    telegram_thread.start()
+    logger.info("Telegram bot thread started.")
+
+    # Keep main thread alive indefinitely
+    while True:
+        time.sleep(60)
+        logger.debug("Main thread alive – keeping container running.")
