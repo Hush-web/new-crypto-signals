@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Multi-Asset Consensus Trading Bot – Complete Version (HTML sanitized)
+Multi-Asset Consensus Trading Bot – Complete Version with Telegram Auto-Restart
 """
 
 import os
@@ -67,21 +67,15 @@ logger = logging.getLogger("multi-trader")
 
 # ---------------------------- HTML SANITIZER ----------------------------
 def sanitize_html(text: str) -> str:
-    """Escape HTML tags except allowed ones: b, strong, i, em, u, ins, s, strike, del, a, code, pre."""
-    # Allowed tags (keep them intact)
     allowed_tags = r'<\/?(b|strong|i|em|u|ins|s|strike|del|a|code|pre)(?:\s[^>]*)?>'
-    # Temporarily replace allowed tags with placeholders
     placeholders = {}
     def replacer(match):
         tag = match.group(0)
         placeholder = f"__TAG_{len(placeholders)}__"
         placeholders[placeholder] = tag
         return placeholder
-    # Replace allowed tags with placeholders
     temp = re.sub(allowed_tags, replacer, text, flags=re.IGNORECASE)
-    # Escape remaining < and >
     temp = temp.replace('<', '&lt;').replace('>', '&gt;')
-    # Restore placeholders
     for placeholder, tag in placeholders.items():
         temp = temp.replace(placeholder, tag)
     return temp
@@ -547,7 +541,7 @@ class LiveBroker:
         logger.info(f"[LIVE] {side} {size} {symbol} at {price}")
         return {"status": "live_placeholder"}
 
-# ---------------------------- MULTI-ASSET TRADER (with HTML sanitizer) ----------------------------
+# ---------------------------- MULTI-ASSET TRADER ----------------------------
 class MultiTrader:
     def __init__(self, symbols, initial_balance, risk_mgr, db, telegram_token, chat_id, live_broker):
         valid_symbols = get_kucoin_symbols()
@@ -587,7 +581,6 @@ class MultiTrader:
     def send_alert(self, message):
         if not self.telegram_token or not self.chat_id:
             return
-        # Sanitize HTML to avoid BadRequest
         safe_msg = sanitize_html(message)
         try:
             requests.post(
@@ -597,7 +590,6 @@ class MultiTrader:
             )
         except Exception as e:
             logger.error(f"Telegram send error: {e}")
-            # Fallback: send plain text without parse_mode
             try:
                 requests.post(
                     f"https://api.telegram.org/bot{self.telegram_token}/sendMessage",
@@ -851,7 +843,7 @@ trader_global = None
 
 @app.route('/')
 def health():
-    return jsonify({"status": "running", "version": "complete-html-fix", "time": datetime.now().isoformat()})
+    return jsonify({"status": "running", "version": "final-auto-restart", "time": datetime.now().isoformat()})
 
 @app.route('/download')
 def download_csv():
@@ -1025,24 +1017,32 @@ async def handle_button(update: Update, context):
     elif text == "❓ Help":
         await help_cmd(update, context)
 
-# ---------------------------- MAIN ----------------------------
+# ---------------------------- MAIN (with Telegram auto-restart) ----------------------------
 def run_telegram():
+    """Run Telegram bot with infinite retry loop."""
     if not Config.TELEGRAM_TOKEN:
         logger.warning("No Telegram token, skipping bot.")
         return
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    app_tg = Application.builder().token(Config.TELEGRAM_TOKEN).build()
-    app_tg.add_handler(CommandHandler("start", start))
-    app_tg.add_handler(CommandHandler("help", help_cmd))
-    app_tg.add_handler(CommandHandler("status", status_cmd))
-    app_tg.add_handler(CommandHandler("performance", performance))
-    app_tg.add_handler(CommandHandler("backtest", backtest))
-    app_tg.add_handler(CommandHandler("scan", scan))
-    app_tg.add_handler(CommandHandler("pause", pause))
-    app_tg.add_handler(CommandHandler("resume", resume))
-    app_tg.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_button))
-    app_tg.run_polling()
+    while True:
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            app_tg = Application.builder().token(Config.TELEGRAM_TOKEN).build()
+            app_tg.add_handler(CommandHandler("start", start))
+            app_tg.add_handler(CommandHandler("help", help_cmd))
+            app_tg.add_handler(CommandHandler("status", status_cmd))
+            app_tg.add_handler(CommandHandler("performance", performance))
+            app_tg.add_handler(CommandHandler("backtest", backtest))
+            app_tg.add_handler(CommandHandler("scan", scan))
+            app_tg.add_handler(CommandHandler("pause", pause))
+            app_tg.add_handler(CommandHandler("resume", resume))
+            app_tg.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_button))
+            logger.info("Telegram bot started, polling...")
+            app_tg.run_polling()
+        except Exception as e:
+            logger.error(f"Telegram polling crashed: {e}. Restarting in 10 seconds...")
+            time.sleep(10)
+            continue
 
 if __name__ == "__main__":
     db = TradeDB(Config.DB_FILE)
@@ -1068,12 +1068,16 @@ if __name__ == "__main__":
     )
     trader_global = trader
 
+    # Start trading loop in background thread
     threading.Thread(target=trader.run_loop, daemon=True).start()
+
+    # Start Flask server in background thread
     threading.Thread(
         target=app.run,
         kwargs={'host': '0.0.0.0', 'port': int(os.getenv('PORT', 5000))},
         daemon=True
     ).start()
 
+    # Run Telegram bot on main thread (with infinite restart loop)
     logger.info("Starting Telegram bot on main thread...")
     run_telegram()
