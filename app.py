@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Multi-Asset Consensus Trading Bot – Final Stable (Telegram in thread + keep-alive)
+Multi-Asset Consensus Trading Bot – Main Thread Telegram (Signal Handler Fix)
 """
 
 import os
@@ -836,7 +836,7 @@ trader_global = None
 
 @app.route('/')
 def health():
-    return jsonify({"status": "running", "version": "final-stable", "time": datetime.now().isoformat()})
+    return jsonify({"status": "running", "version": "main-thread-telegram", "time": datetime.now().isoformat()})
 
 @app.route('/download')
 def download_csv():
@@ -1016,9 +1016,9 @@ async def handle_button(update: Update, context):
     elif text == "❓ Help":
         await help_cmd(update, context)
 
-# ---------------------------- MAIN ----------------------------
+# ---------------------------- TELEGRAM RUNNER (Main Thread) ----------------------------
 def run_telegram():
-    """Run Telegram bot in a separate thread with its own event loop."""
+    """Run Telegram bot with infinite retry loop on the main thread."""
     if not Config.TELEGRAM_TOKEN:
         logger.warning("No Telegram token, skipping bot.")
         return
@@ -1043,6 +1043,7 @@ def run_telegram():
             time.sleep(10)
             continue
 
+# ---------------------------- MAIN ----------------------------
 if __name__ == "__main__":
     db = TradeDB(Config.DB_FILE)
     risk_mgr = RiskManager(Config.INITIAL_BALANCE, {
@@ -1067,22 +1068,16 @@ if __name__ == "__main__":
     )
     trader_global = trader
 
-    # Start trading loop in background thread
+    # Start trading loop in a background daemon thread
     threading.Thread(target=trader.run_loop, daemon=True).start()
 
-    # Start Flask server in background thread
+    # Start Flask server in a background daemon thread
     threading.Thread(
         target=app.run,
         kwargs={'host': '0.0.0.0', 'port': int(os.getenv('PORT', 5000))},
         daemon=True
     ).start()
 
-    # Run Telegram bot in its own thread (with restart loop)
-    telegram_thread = threading.Thread(target=run_telegram, daemon=False)
-    telegram_thread.start()
-    logger.info("Telegram bot thread started.")
-
-    # Keep main thread alive indefinitely
-    while True:
-        time.sleep(60)
-        logger.debug("Main thread alive – keeping container running.")
+    # Run Telegram bot on the main thread (so signal handlers work)
+    logger.info("Starting Telegram bot on main thread...")
+    run_telegram()
