@@ -1,10 +1,6 @@
 #!/usr/bin/env python3
 """
-Multi-Asset Consensus Trading Bot – Final Production (Fully Fixed)
-- Realistic backtest (12 months, fees, slippage, intra-bar SL/TP)
-- Walk-forward optimization (grid search over thresholds)
-- Enhanced signals (volume momentum, whale aggressiveness)
-- Fixed paper short, missing reload_settings, pagination fixed
+Multi-Asset Consensus Trading Bot – Final Production (Optimization in Background)
 """
 
 import os
@@ -57,7 +53,6 @@ class Config:
     EXCHANGE_SECRET = os.getenv("EXCHANGE_SECRET", "")
     LIVE_TRADING = bool(EXCHANGE_NAME and EXCHANGE_API_KEY and EXCHANGE_SECRET)
 
-    # Independent signal weights (base)
     SOURCE_WEIGHTS = {
         "ma": float(os.getenv("WEIGHT_MA", "0.6")),
         "volume_momentum": float(os.getenv("WEIGHT_VOLUME_MOMENTUM", "0.5")),
@@ -351,7 +346,7 @@ class PerformanceLogger:
             logger.error(f"CSV read error: {e}")
             return None
 
-# ---------------------------- MARKET DATA (KuCoin) with corrected pagination ----------------------------
+# ---------------------------- MARKET DATA (KuCoin) ----------------------------
 class MarketData:
     def __init__(self, symbol):
         self.symbol = symbol
@@ -380,7 +375,7 @@ class MarketData:
         data = self._fetch_kucoin("/api/v1/market/candles", params)
         if not data:
             return None
-        data = data[::-1]  # reverse to chronological
+        data = data[::-1]
         ohlcv = []
         for candle in data:
             try:
@@ -398,7 +393,6 @@ class MarketData:
         return np.array(ohlcv)
 
     def get_ohlcv_multi_month(self, months=12, timeframe='1hour'):
-        """Fetch up to 12 months of OHLCV using time-based pagination (fixed)."""
         if months <= 0:
             months = 1
         now = int(time.time())
@@ -420,17 +414,15 @@ class MarketData:
                 break
             all_candles.extend(data)
             if len(data) > 0:
-                # oldest candle is the first in the list (ascending order)
                 oldest_ts = int(data[0][0])
                 end = oldest_ts - 1
             else:
                 break
-            time.sleep(0.2)  # rate limit
+            time.sleep(0.2)
 
         if not all_candles:
             return None
 
-        # Reverse to chronological (oldest first)
         all_candles = all_candles[::-1]
         ohlcv = []
         for candle in all_candles:
@@ -512,7 +504,6 @@ class VolumeMomentumSource(SignalSource):
             return None
         close = ohlcv[:, 1]
         volume = ohlcv[:, 4]
-        # Use 10-period averages
         avg_vol = np.mean(volume[-10:-1])
         avg_change = np.mean(np.diff(close[-11:])) / np.mean(close[-11:-1]) if np.mean(close[-11:-1]) != 0 else 0
         curr_vol = volume[-1]
@@ -731,7 +722,7 @@ class LiveBroker:
         logger.info(f"[LIVE] {side} {size} {symbol} at {price}")
         return {"status": "live_placeholder"}
 
-# ---------------------------- MULTI-ASSET TRADER (fixed) ----------------------------
+# ---------------------------- MULTI-ASSET TRADER (with background optimization) ----------------------------
 class MultiTrader:
     def __init__(self, symbols, initial_balance, risk_mgr, db, telegram_token, chat_id, live_broker):
         self.db = db
@@ -753,10 +744,15 @@ class MultiTrader:
         self.last_prices = {}
         self.heartbeat_counter = 0
 
-        # Per-symbol optimized thresholds
+        # Per-symbol optimized thresholds (populated by background optimization)
         self.optimal_thresholds = {}
+
+        # Start optimization in a background thread if enabled
         if Config.OPTIMIZE_ON_START:
-            self.run_optimization()
+            logger.info("Starting optimization in background thread...")
+            threading.Thread(target=self.run_optimization, daemon=True).start()
+        else:
+            logger.info("Optimization disabled (OPTIMIZE_ON_START=false)")
 
     def _init_symbols(self, default_symbols):
         if self.override_settings and 'symbols' in self.override_settings:
@@ -782,17 +778,16 @@ class MultiTrader:
                 WhaleSource(self.markets[sym], self.db),
             ]
 
-    # ------------------------ MISSING reload_settings() - FIXED ------------------------
     def reload_settings(self):
-        """Reload settings from database and reinitialize symbols and market data."""
         if self.chat_id:
             self.override_settings = self.settings_manager.get(int(self.chat_id))
-            self._init_symbols(Config.SYMBOLS)  # uses self.symbols from settings
+            self._init_symbols(Config.SYMBOLS)
             self._init_market_data()
             logger.info("Settings reloaded and market data updated")
 
-    # ------------------------ WALK-FORWARD OPTIMIZATION ------------------------
+    # ------------------------ WALK-FORWARD OPTIMIZATION (background) ------------------------
     def run_optimization(self):
+        """Run walk-forward optimization for each symbol in background."""
         for sym in self.symbols:
             try:
                 logger.info(f"Running optimization for {sym}...")
@@ -804,6 +799,7 @@ class MultiTrader:
                     logger.info(f"Optimal threshold for {sym}: {best_th:.2f}")
             except Exception as e:
                 logger.error(f"Optimization failed for {sym}: {e}")
+        logger.info("Optimization complete for all symbols.")
 
     def optimize_threshold(self, symbol, train_days=60, test_days=30):
         total_days = train_days + test_days
@@ -820,7 +816,7 @@ class MultiTrader:
 
         thresholds = np.arange(0.2, 0.85, 0.05)
         best_th = 0.4
-        best_sharpe = -999
+        best_score = -999
         for th in thresholds:
             train_result = self._run_backtest_on_data(symbol, train_data, threshold=th, months=0)
             if train_result is None or isinstance(train_result, str):
@@ -829,8 +825,8 @@ class MultiTrader:
             if test_result is None or isinstance(test_result, str):
                 continue
             score = test_result.get('profit_factor', 0) * test_result.get('win_rate', 0) / 100
-            if score > best_sharpe:
-                best_sharpe = score
+            if score > best_score:
+                best_score = score
                 best_th = th
         return best_th
 
