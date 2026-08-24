@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Multi-Asset Consensus Trading Bot – Final Production (Fixed Event Loop & Conflict)
+Multi-Asset Consensus Trading Bot – Production with Enhanced Logging
 """
 
 import os
@@ -723,7 +723,7 @@ class LiveBroker:
         logger.info(f"[LIVE] {side} {size} {symbol} at {price}")
         return {"status": "live_placeholder"}
 
-# ---------------------------- MULTI-ASSET TRADER ----------------------------
+# ---------------------------- MULTI-ASSET TRADER (with enhanced logging) ----------------------------
 class MultiTrader:
     def __init__(self, symbols, initial_balance, risk_mgr, db, telegram_token, chat_id, live_broker):
         self.db = db
@@ -1066,8 +1066,9 @@ class MultiTrader:
             trend_ok = True
         return price, atr, trend_ok, trend_ma
 
-    # ------------------------ EXECUTE SIGNAL ------------------------
+    # ------------------------ EXECUTE SIGNAL (with enhanced logging) ------------------------
     def execute_signal(self, symbol, direction, price, atr, tf_details, trend_ok):
+        logger.info(f"execute_signal called for {symbol}, direction={direction}, price={price:.2f}")
         settings = self.override_settings or {}
         can_trade, reason = self.risk_mgr.can_trade(symbol, price, atr, trend_ok, settings)
         if not can_trade:
@@ -1076,6 +1077,7 @@ class MultiTrader:
 
         size = self.risk_mgr.compute_position_size(self.balance, price, atr, settings)
         if size <= 0:
+            logger.info(f"Position size zero for {symbol}")
             return
         risk = atr * 2.5
         stop_loss = price - risk if direction == 1 else price + risk
@@ -1093,6 +1095,7 @@ class MultiTrader:
 
         self.risk_mgr.open_position(symbol, side, price, size, stop_loss, take_profit)
         self.db.log_trade(int(time.time()), symbol, side, price, size, 0.0, 0.0, self.balance)
+        logger.info(f"Trade opened for {symbol}: {side} {size:.4f} @ {price:.2f}")
 
         details_html = "<br>".join([sanitize_html(f"• {d}") for d in tf_details])
         msg = (
@@ -1107,14 +1110,16 @@ class MultiTrader:
         )
         self.send_alert(msg)
 
-    # ------------------------ STEP (main loop) ------------------------
+    # ------------------------ STEP (main loop with enhanced logging) ------------------------
     def step(self):
         for symbol in self.symbols:
             result = self.get_price_and_atr(symbol, timeframe='1hour')
             if result is None or result[0] is None:
+                logger.warning(f"Could not get price/ATR for {symbol}, skipping")
                 continue
             price, atr, trend_ok, trend_ma = result
 
+            # Check existing positions
             pnl, status, pos = self.risk_mgr.check_sl_tp(symbol, price)
             if pnl != 0 and pos is not None:
                 with self.balance_lock:
@@ -1137,11 +1142,14 @@ class MultiTrader:
             if self.risk_mgr.open_positions.get(symbol, []):
                 continue
 
+            # Get consensus
             direction, tf_details = self.get_multi_tf_signal(symbol, price, atr, trend_ok)
-            if direction == 0:
-                continue
-
-            self.execute_signal(symbol, direction, price, atr, tf_details, trend_ok)
+            if direction != 0:
+                logger.info(f"Consensus for {symbol}: direction={direction}, details={tf_details}")
+                self.execute_signal(symbol, direction, price, atr, tf_details, trend_ok)
+            else:
+                # Log occasionally for debugging
+                pass
 
     def run_loop(self):
         logger.info("Starting multi-asset trading loop. Symbols: %s", self.symbols)
@@ -1598,10 +1606,12 @@ async def handle_button(update: Update, context):
     except Exception as e:
         logger.error(f"Error in handle_button: {e}", exc_info=True)
 
-# ---------------------------- KEEP-ALIVE ----------------------------
+# ---------------------------- KEEP-ALIVE (fixed: wait for Flask to start) ----------------------------
 def keep_alive():
     port = os.getenv('PORT', 5000)
     url = f"http://localhost:{port}/"
+    # Wait for Flask to be ready
+    time.sleep(5)
     while True:
         try:
             requests.get(url, timeout=5)
@@ -1630,7 +1640,6 @@ def run_telegram():
     if not Config.TELEGRAM_TOKEN:
         logger.warning("No Telegram token, skipping bot.")
         return
-    # Build application once
     app_tg = Application.builder().token(Config.TELEGRAM_TOKEN).build()
     app_tg.add_handler(CommandHandler("start", start))
     app_tg.add_handler(CommandHandler("help", help_cmd))
@@ -1650,7 +1659,6 @@ def run_telegram():
     while True:
         try:
             logger.info("Telegram bot started, polling...")
-            # Create a new event loop for this thread (main thread)
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             app_tg.run_polling()
@@ -1706,7 +1714,7 @@ if __name__ == "__main__":
         daemon=True
     ).start()
 
-    # Start keep-alive thread
+    # Start keep-alive thread (with initial sleep)
     threading.Thread(target=keep_alive, daemon=True).start()
     logger.info("Keep-alive thread started.")
 
