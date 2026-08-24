@@ -572,14 +572,14 @@ class RiskManager:
         max_daily_loss_pct = settings.get('max_daily_loss_pct', Config.MAX_DAILY_LOSS_PCT)
         max_positions_global = settings.get('max_positions_global', Config.MAX_POSITIONS_GLOBAL)
         max_drawdown = settings.get('max_drawdown', Config.MAX_DRAWDOWN)
-        consecutive_loss_limit = self.config['CONSECUTIVE_LOSS_LIMIT']  # this is not user-overridable yet, but could be
+        consecutive_loss_limit = self.config['CONSECUTIVE_LOSS_LIMIT']  # not overridable currently
         volatility_min = settings.get('volatility_min', Config.VOLATILITY_MIN)
         with self.lock:
             if self.daily_pnl < -max_daily_loss_pct * self.initial_balance:
                 return False, "Daily loss limit"
             if self.get_total_positions() >= max_positions_global:
                 return False, "Global max positions"
-            if self.open_positions.get(symbol, []) and len(self.open_positions[symbol]) >= Config.MAX_POSITIONS_PER_SYMBOL:  # not user-overridable
+            if self.open_positions.get(symbol, []) and len(self.open_positions[symbol]) >= Config.MAX_POSITIONS_PER_SYMBOL:
                 return False, "Max per symbol"
             if self.consecutive_losses >= Config.CONSECUTIVE_LOSS_LIMIT:
                 return False, "Consecutive loss limit"
@@ -1049,7 +1049,7 @@ async def start(update: Update, context):
         "/status – Account\n/scan – Force scan\n/performance – Stats\n"
         "/backtest <symbol> – Run backtest\n"
         "/settings – View/Edit settings\n"
-        "/set <key> <value> – Change a setting\n"
+        "/set &lt;key&gt; &lt;value&gt; – Change a setting\n"
         "/reset – Reset to defaults\n"
         "/pause – Pause\n/resume – Resume\n/help – This\n\n"
         "💾 <a href='https://new-crypto-signals.onrender.com/download'>Download CSV</a>",
@@ -1062,7 +1062,7 @@ async def help_cmd(update: Update, context):
         "/status – Account\n/scan – Force scan\n/performance – Stats\n"
         "/backtest <symbol> – Run backtest\n"
         "/settings – View/Edit settings\n"
-        "/set <key> <value> – Change a setting\n"
+        "/set &lt;key&gt; &lt;value&gt; – Change a setting\n"
         "/reset – Reset to defaults\n"
         "/pause – Pause\n/resume – Resume\n/help – This",
         parse_mode='HTML', reply_markup=get_main_keyboard()
@@ -1238,7 +1238,7 @@ async def settings_cmd(update: Update, context):
         f"⚖️ Weight RSI: {settings['weight_rsi']}\n"
         f"⚖️ Weight Sentiment: {settings['weight_sentiment']}\n"
         f"⚖️ Weight Breakout: {settings['weight_breakout']}\n\n"
-        "Use /set <key> <value> to change, e.g.\n"
+        "Use /set &lt;key&gt; &lt;value&gt; to change, e.g.\n"
         "<code>/set consensus_threshold 0.45</code>\n"
         "<code>/set symbols BTC-USDT,ETH-USDT</code>\n"
         "Or /reset to restore defaults."
@@ -1249,7 +1249,7 @@ async def set_cmd(update: Update, context):
     chat_id = update.effective_user.id
     args = context.args
     if len(args) < 2:
-        await update.message.reply_text("Usage: /set <key> <value>\nExample: /set consensus_threshold 0.45", reply_markup=get_main_keyboard())
+        await update.message.reply_text("Usage: /set &lt;key&gt; &lt;value&gt;\nExample: /set consensus_threshold 0.45", reply_markup=get_main_keyboard())
         return
     key = args[0]
     value = ' '.join(args[1:])
