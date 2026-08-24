@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Multi-Asset Consensus Trading Bot – Final Production (Fixed Telegram Conflict)
+Multi-Asset Consensus Trading Bot – Final Production (Fixed Event Loop & Conflict)
 """
 
 import os
@@ -19,6 +19,7 @@ from dotenv import load_dotenv
 from flask import Flask, jsonify, send_file
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.error import Conflict
 
 load_dotenv()
 
@@ -722,7 +723,7 @@ class LiveBroker:
         logger.info(f"[LIVE] {side} {size} {symbol} at {price}")
         return {"status": "live_placeholder"}
 
-# ---------------------------- MULTI-ASSET TRADER (fixed None and conflict) ----------------------------
+# ---------------------------- MULTI-ASSET TRADER ----------------------------
 class MultiTrader:
     def __init__(self, symbols, initial_balance, risk_mgr, db, telegram_token, chat_id, live_broker):
         self.db = db
@@ -1226,7 +1227,7 @@ def test_telegram():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# ---------------------------- TELEGRAM BOT (fixed conflict) ----------------------------
+# ---------------------------- TELEGRAM BOT ----------------------------
 def get_main_keyboard():
     buttons = [
         [KeyboardButton("📊 Status"), KeyboardButton("🔍 Scan")],
@@ -1624,12 +1625,12 @@ def start_trading_loop_with_restart(trader):
             time.sleep(10)
             continue
 
-# ---------------------------- TELEGRAM RUNNER (fixed conflict) ----------------------------
+# ---------------------------- TELEGRAM RUNNER (Fixed Event Loop & Conflict) ----------------------------
 def run_telegram():
     if not Config.TELEGRAM_TOKEN:
         logger.warning("No Telegram token, skipping bot.")
         return
-    # Create application once
+    # Build application once
     app_tg = Application.builder().token(Config.TELEGRAM_TOKEN).build()
     app_tg.add_handler(CommandHandler("start", start))
     app_tg.add_handler(CommandHandler("help", help_cmd))
@@ -1646,14 +1647,15 @@ def run_telegram():
     app_tg.add_handler(CommandHandler("reset", reset_cmd))
     app_tg.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_button))
 
-    # Run polling with retry on conflict
     while True:
         try:
             logger.info("Telegram bot started, polling...")
+            # Create a new event loop for this thread (main thread)
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
             app_tg.run_polling()
-        except telegram.error.Conflict:
+        except Conflict:
             logger.warning("Conflict detected (another instance running). Stopping and retrying in 15 seconds...")
-            # Stop the application gracefully
             try:
                 app_tg.stop()
             except:
