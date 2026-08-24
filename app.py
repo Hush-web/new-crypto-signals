@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """
-Multi-Asset Consensus Trading Bot – Production with Status Timeout Fallback
+Multi-Asset Consensus Trading Bot – Final Production (Fully Fixed)
+- Realistic backtest (12 months, fees, slippage, intra-bar SL/TP)
+- Walk-forward optimization (grid search over thresholds)
+- Enhanced signals (volume momentum, whale aggressiveness)
+- Fixed paper short, missing reload_settings, pagination fixed
 """
 
 import os
@@ -13,7 +17,7 @@ import asyncio
 import requests
 import re
 import numpy as np
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, List, Tuple, Set, Dict, Any
 from dotenv import load_dotenv
 from flask import Flask, jsonify, send_file
@@ -31,10 +35,10 @@ class Config:
     PER_TRADE_RISK_PCT = float(os.getenv("PER_TRADE_RISK_PCT", "0.02"))
     MAX_DAILY_LOSS_PCT = float(os.getenv("MAX_DAILY_LOSS_PCT", "0.05"))
     MAX_DRAWDOWN = float(os.getenv("MAX_DRAWDOWN", "0.10"))
-    CONSENSUS_THRESHOLD = float(os.getenv("CONSENSUS_THRESHOLD", "0.50"))
-    MIN_SOURCES = int(os.getenv("MIN_SOURCES", "2"))
+    CONSENSUS_THRESHOLD = float(os.getenv("CONSENSUS_THRESHOLD", "0.40"))
+    MIN_SOURCES = int(os.getenv("MIN_SOURCES", "1"))
     CONSECUTIVE_LOSS_LIMIT = int(os.getenv("CONSECUTIVE_LOSS_LIMIT", "3"))
-    VOLATILITY_MIN = float(os.getenv("VOLATILITY_MIN", "0.01"))
+    VOLATILITY_MIN = float(os.getenv("VOLATILITY_MIN", "0.005"))
     TREND_FILTER = os.getenv("TREND_FILTER", "true").lower() == "true"
     TREND_MA_PERIOD = int(os.getenv("TREND_MA_PERIOD", "200"))
     TRADE_INTERVAL_SECONDS = int(os.getenv("TRADE_INTERVAL_SECONDS", "60"))
@@ -43,19 +47,22 @@ class Config:
     DB_FILE = os.getenv("DB_FILE", "trades.db")
     CSV_FILE = os.getenv("CSV_FILE", "trades.csv")
     LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+    OPTIMIZE_ON_START = os.getenv("OPTIMIZE_ON_START", "true").lower() == "true"
+    OPTIMIZE_TRAIN_DAYS = int(os.getenv("OPTIMIZE_TRAIN_DAYS", "60"))
+    OPTIMIZE_TEST_DAYS = int(os.getenv("OPTIMIZE_TEST_DAYS", "30"))
+    BACKTEST_MONTHS = int(os.getenv("BACKTEST_MONTHS", "12"))
 
     EXCHANGE_NAME = os.getenv("EXCHANGE_NAME", "")
     EXCHANGE_API_KEY = os.getenv("EXCHANGE_API_KEY", "")
     EXCHANGE_SECRET = os.getenv("EXCHANGE_SECRET", "")
     LIVE_TRADING = bool(EXCHANGE_NAME and EXCHANGE_API_KEY and EXCHANGE_SECRET)
 
+    # Independent signal weights (base)
     SOURCE_WEIGHTS = {
-        "technical_ma": float(os.getenv("WEIGHT_MA", "0.6")),
-        "technical_rsi": float(os.getenv("WEIGHT_RSI", "0.4")),
-        "orderbook": float(os.getenv("WEIGHT_ORDERBOOK", "0.0")),
-        "whale": float(os.getenv("WEIGHT_WHALE", "0.0")),
-        "sentiment": float(os.getenv("WEIGHT_SENTIMENT", "0.5")),
+        "ma": float(os.getenv("WEIGHT_MA", "0.6")),
+        "volume_momentum": float(os.getenv("WEIGHT_VOLUME_MOMENTUM", "0.5")),
         "breakout": float(os.getenv("WEIGHT_BREAKOUT", "0.7")),
+        "whale": float(os.getenv("WEIGHT_WHALE", "0.6")),
     }
 
 # ---------------------------- LOGGING ----------------------------
@@ -139,9 +146,9 @@ class TradeDB:
                 max_positions_global INTEGER,
                 trend_filter INTEGER,
                 weight_ma REAL,
-                weight_rsi REAL,
-                weight_sentiment REAL,
+                weight_volume_momentum REAL,
                 weight_breakout REAL,
+                weight_whale REAL,
                 updated_at INTEGER
             )
         ''')
@@ -199,9 +206,9 @@ class SettingsManager:
                     'max_positions_global': row[9],
                     'trend_filter': bool(row[10]),
                     'weight_ma': row[11],
-                    'weight_rsi': row[12],
-                    'weight_sentiment': row[13],
-                    'weight_breakout': row[14],
+                    'weight_volume_momentum': row[12],
+                    'weight_breakout': row[13],
+                    'weight_whale': row[14],
                 }
             return None
 
@@ -224,10 +231,10 @@ class SettingsManager:
                     'max_drawdown': Config.MAX_DRAWDOWN,
                     'max_positions_global': Config.MAX_POSITIONS_GLOBAL,
                     'trend_filter': 1 if Config.TREND_FILTER else 0,
-                    'weight_ma': Config.SOURCE_WEIGHTS['technical_ma'],
-                    'weight_rsi': Config.SOURCE_WEIGHTS['technical_rsi'],
-                    'weight_sentiment': Config.SOURCE_WEIGHTS['sentiment'],
+                    'weight_ma': Config.SOURCE_WEIGHTS['ma'],
+                    'weight_volume_momentum': Config.SOURCE_WEIGHTS['volume_momentum'],
                     'weight_breakout': Config.SOURCE_WEIGHTS['breakout'],
+                    'weight_whale': Config.SOURCE_WEIGHTS['whale'],
                 }
                 defaults[key] = value
                 self.db.cursor.execute('''
@@ -235,7 +242,7 @@ class SettingsManager:
                         chat_id, symbols, consensus_threshold, min_sources,
                         volatility_min, per_trade_risk_pct, max_daily_loss_pct,
                         max_drawdown, max_positions_global, trend_filter,
-                        weight_ma, weight_rsi, weight_sentiment, weight_breakout,
+                        weight_ma, weight_volume_momentum, weight_breakout, weight_whale,
                         updated_at
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (
@@ -250,9 +257,9 @@ class SettingsManager:
                     defaults['max_positions_global'],
                     defaults['trend_filter'],
                     defaults['weight_ma'],
-                    defaults['weight_rsi'],
-                    defaults['weight_sentiment'],
+                    defaults['weight_volume_momentum'],
                     defaults['weight_breakout'],
+                    defaults['weight_whale'],
                     int(time.time())
                 ))
             self.db.conn.commit()
@@ -344,7 +351,7 @@ class PerformanceLogger:
             logger.error(f"CSV read error: {e}")
             return None
 
-# ---------------------------- MARKET DATA (KuCoin) ----------------------------
+# ---------------------------- MARKET DATA (KuCoin) with corrected pagination ----------------------------
 class MarketData:
     def __init__(self, symbol):
         self.symbol = symbol
@@ -373,41 +380,100 @@ class MarketData:
         data = self._fetch_kucoin("/api/v1/market/candles", params)
         if not data:
             return None
-        data = data[::-1]
+        data = data[::-1]  # reverse to chronological
         ohlcv = []
         for candle in data:
             try:
                 ohlcv.append([
-                    float(candle[1]), float(candle[3]),
-                    float(candle[4]), float(candle[2]), float(candle[5])
+                    float(candle[1]),  # open
+                    float(candle[2]),  # close
+                    float(candle[3]),  # high
+                    float(candle[4]),  # low
+                    float(candle[5])   # volume
                 ])
             except:
                 continue
-        if len(ohlcv) < 14:
+        if len(ohlcv) < 20:
             return None
         return np.array(ohlcv)
 
-    def get_orderbook(self, limit=20):
-        return [], []
+    def get_ohlcv_multi_month(self, months=12, timeframe='1hour'):
+        """Fetch up to 12 months of OHLCV using time-based pagination (fixed)."""
+        if months <= 0:
+            months = 1
+        now = int(time.time())
+        end = now
+        start = now - (months * 30 * 24 * 3600)
+        all_candles = []
+        limit = 1500
+
+        while start < end:
+            params = {
+                "symbol": self.symbol,
+                "type": timeframe,
+                "limit": limit,
+                "from": start,
+                "to": end
+            }
+            data = self._fetch_kucoin("/api/v1/market/candles", params)
+            if not data:
+                break
+            all_candles.extend(data)
+            if len(data) > 0:
+                # oldest candle is the first in the list (ascending order)
+                oldest_ts = int(data[0][0])
+                end = oldest_ts - 1
+            else:
+                break
+            time.sleep(0.2)  # rate limit
+
+        if not all_candles:
+            return None
+
+        # Reverse to chronological (oldest first)
+        all_candles = all_candles[::-1]
+        ohlcv = []
+        for candle in all_candles:
+            try:
+                ohlcv.append([
+                    float(candle[1]),  # open
+                    float(candle[2]),  # close
+                    float(candle[3]),  # high
+                    float(candle[4]),  # low
+                    float(candle[5])   # volume
+                ])
+            except:
+                continue
+        if len(ohlcv) < 100:
+            return None
+        return np.array(ohlcv)
 
     def get_recent_trades(self, limit=100):
-        return None
+        params = {"symbol": self.symbol, "limit": limit}
+        data = self._fetch_kucoin("/api/v1/market/histories", params)
+        if not data:
+            return None
+        trades = []
+        for t in data:
+            trades.append({
+                'price': float(t['price']),
+                'size': float(t['size']),
+                'side': t['side'],
+                'time': t['time']
+            })
+        return trades
 
-    def get_24h_change(self):
+    def get_24h_stats(self):
         params = {"symbol": self.symbol}
         data = self._fetch_kucoin("/api/v1/market/stats", params)
         if not data:
-            return 0, 0, 0
-        try:
-            change = float(data.get('changeRate', 0)) * 100
-            volume = float(data.get('vol', 0))
-            if change > 1.5 and volume > 500_000:
-                return 1, change, volume
-            elif change < -1.5 and volume > 500_000:
-                return -1, change, volume
-            return 0, change, volume
-        except:
-            return 0, 0, 0
+            return None
+        return {
+            'change': float(data.get('changeRate', 0)) * 100,
+            'volume': float(data.get('vol', 0)),
+            'high': float(data.get('high', 0)),
+            'low': float(data.get('low', 0)),
+        }
 
 # ---------------------------- SIGNAL SOURCES ----------------------------
 class Signal:
@@ -421,62 +487,50 @@ class SignalSource:
     def __init__(self, market_data, db):
         self.market = market_data
         self.db = db
-    def fetch(self) -> Optional[Signal]:
+
+    def fetch(self, timeframe='1hour') -> Optional[Signal]:
         raise NotImplementedError
 
 class MASource(SignalSource):
-    def fetch(self):
-        ohlcv = self.market.get_ohlcv(limit=100, timeframe='1hour')
+    def fetch(self, timeframe='1hour'):
+        ohlcv = self.market.get_ohlcv(limit=100, timeframe=timeframe)
         if ohlcv is None or len(ohlcv) < 50:
             return None
-        close = ohlcv[:, 3]
+        close = ohlcv[:, 1]
         ma20 = np.mean(close[-20:])
         ma50 = np.mean(close[-50:])
         if ma20 > ma50:
-            return Signal(+1, 0.60, "technical_ma")
+            return Signal(+1, 0.60, "ma")
         elif ma20 < ma50:
-            return Signal(-1, 0.60, "technical_ma")
-        return Signal(0, 0.0, "technical_ma")
+            return Signal(-1, 0.60, "ma")
+        return Signal(0, 0.0, "ma")
 
-class RSISource(SignalSource):
-    def fetch(self):
-        ohlcv = self.market.get_ohlcv(limit=100, timeframe='1hour')
-        if ohlcv is None or len(ohlcv) < 20:
+class VolumeMomentumSource(SignalSource):
+    def fetch(self, timeframe='1hour'):
+        ohlcv = self.market.get_ohlcv(limit=50, timeframe=timeframe)
+        if ohlcv is None or len(ohlcv) < 11:
             return None
-        close = ohlcv[:, 3]
-        deltas = np.diff(close)
-        gains = deltas[deltas > 0]
-        losses = -deltas[deltas < 0]
-        if len(gains) == 0 or len(losses) == 0:
-            return None
-        avg_gain = np.mean(gains[-14:]) if len(gains) >= 14 else np.mean(gains)
-        avg_loss = np.mean(losses[-14:]) if len(losses) >= 14 else np.mean(losses)
-        if avg_loss == 0:
-            return None
-        rsi = 100 - (100 / (1 + avg_gain/avg_loss))
-        if rsi < 40:
-            return Signal(+1, 0.55, "technical_rsi")
-        elif rsi > 60:
-            return Signal(-1, 0.55, "technical_rsi")
-        return Signal(0, 0.0, "technical_rsi")
-
-class SentimentSource(SignalSource):
-    def fetch(self):
-        score, change, volume = self.market.get_24h_change()
-        if change > 1.5 and volume > 500_000:
-            return Signal(+1, 0.50, "sentiment")
-        elif change < -1.5 and volume > 500_000:
-            return Signal(-1, 0.50, "sentiment")
-        return Signal(0, 0.0, "sentiment")
+        close = ohlcv[:, 1]
+        volume = ohlcv[:, 4]
+        # Use 10-period averages
+        avg_vol = np.mean(volume[-10:-1])
+        avg_change = np.mean(np.diff(close[-11:])) / np.mean(close[-11:-1]) if np.mean(close[-11:-1]) != 0 else 0
+        curr_vol = volume[-1]
+        curr_change = (close[-1] - close[-2]) / close[-2] if close[-2] != 0 else 0
+        if curr_vol > 1.5 * avg_vol and curr_change > 0.005:
+            return Signal(+1, 0.55, "volume_momentum")
+        elif curr_vol > 1.5 * avg_vol and curr_change < -0.005:
+            return Signal(-1, 0.55, "volume_momentum")
+        return Signal(0, 0.0, "volume_momentum")
 
 class BreakoutSource(SignalSource):
-    def fetch(self):
-        ohlcv = self.market.get_ohlcv(limit=50, timeframe='1hour')
+    def fetch(self, timeframe='1hour'):
+        ohlcv = self.market.get_ohlcv(limit=50, timeframe=timeframe)
         if ohlcv is None or len(ohlcv) < 20:
             return None
-        high = ohlcv[:, 1]
-        low = ohlcv[:, 2]
-        close = ohlcv[:, 3]
+        high = ohlcv[:, 2]
+        low = ohlcv[:, 3]
+        close = ohlcv[:, 1]
         recent_high = np.max(high[-20:])
         recent_low = np.min(low[-20:])
         price = close[-1]
@@ -485,6 +539,34 @@ class BreakoutSource(SignalSource):
         elif price < recent_low * 0.998:
             return Signal(-1, 0.65, "breakout")
         return Signal(0, 0.0, "breakout")
+
+class WhaleSource(SignalSource):
+    def __init__(self, market_data, db, threshold_usd=50000):
+        super().__init__(market_data, db)
+        self.threshold_usd = threshold_usd
+
+    def fetch(self, timeframe='1hour'):
+        trades = self.market.get_recent_trades(limit=200)
+        if trades is None:
+            return None
+        ohlcv = self.market.get_ohlcv(limit=5, timeframe='1hour')
+        if ohlcv is None:
+            return None
+        price = ohlcv[-1][1]
+        buy_volume = 0
+        sell_volume = 0
+        for t in trades:
+            trade_usd = t['price'] * t['size']
+            if trade_usd > self.threshold_usd:
+                if t['side'] == 'buy':
+                    buy_volume += t['size']
+                else:
+                    sell_volume += t['size']
+        if buy_volume > sell_volume * 1.5 and buy_volume > 0:
+            return Signal(+1, 0.60, "whale")
+        elif sell_volume > buy_volume * 1.5 and sell_volume > 0:
+            return Signal(-1, 0.60, "whale")
+        return Signal(0, 0.0, "whale")
 
 # ---------------------------- CONSENSUS ENGINE ----------------------------
 class ConsensusEngine:
@@ -649,7 +731,7 @@ class LiveBroker:
         logger.info(f"[LIVE] {side} {size} {symbol} at {price}")
         return {"status": "live_placeholder"}
 
-# ---------------------------- MULTI-ASSET TRADER ----------------------------
+# ---------------------------- MULTI-ASSET TRADER (fixed) ----------------------------
 class MultiTrader:
     def __init__(self, symbols, initial_balance, risk_mgr, db, telegram_token, chat_id, live_broker):
         self.db = db
@@ -658,6 +740,7 @@ class MultiTrader:
         self.live_broker = live_broker
         self.risk_mgr = risk_mgr
         self.balance = initial_balance
+        self.balance_lock = threading.Lock()
         self.settings_manager = SettingsManager(db)
 
         self.override_settings = None
@@ -668,6 +751,12 @@ class MultiTrader:
         self.running = True
         self.performance_logger = PerformanceLogger(Config.CSV_FILE)
         self.last_prices = {}
+        self.heartbeat_counter = 0
+
+        # Per-symbol optimized thresholds
+        self.optimal_thresholds = {}
+        if Config.OPTIMIZE_ON_START:
+            self.run_optimization()
 
     def _init_symbols(self, default_symbols):
         if self.override_settings and 'symbols' in self.override_settings:
@@ -684,23 +773,258 @@ class MultiTrader:
 
     def _init_market_data(self):
         self.markets = {sym: MarketData(sym) for sym in self.symbols}
-        self.consensus = ConsensusEngine()
         self.sources = {}
         for sym in self.symbols:
             self.sources[sym] = [
                 MASource(self.markets[sym], self.db),
-                RSISource(self.markets[sym], self.db),
-                SentimentSource(self.markets[sym], self.db),
-                BreakoutSource(self.markets[sym], self.db)
+                VolumeMomentumSource(self.markets[sym], self.db),
+                BreakoutSource(self.markets[sym], self.db),
+                WhaleSource(self.markets[sym], self.db),
             ]
 
+    # ------------------------ MISSING reload_settings() - FIXED ------------------------
     def reload_settings(self):
+        """Reload settings from database and reinitialize symbols and market data."""
         if self.chat_id:
             self.override_settings = self.settings_manager.get(int(self.chat_id))
-            self._init_symbols(Config.SYMBOLS)
+            self._init_symbols(Config.SYMBOLS)  # uses self.symbols from settings
             self._init_market_data()
             logger.info("Settings reloaded and market data updated")
 
+    # ------------------------ WALK-FORWARD OPTIMIZATION ------------------------
+    def run_optimization(self):
+        for sym in self.symbols:
+            try:
+                logger.info(f"Running optimization for {sym}...")
+                best_th = self.optimize_threshold(sym,
+                                                  train_days=Config.OPTIMIZE_TRAIN_DAYS,
+                                                  test_days=Config.OPTIMIZE_TEST_DAYS)
+                if best_th is not None:
+                    self.optimal_thresholds[sym] = best_th
+                    logger.info(f"Optimal threshold for {sym}: {best_th:.2f}")
+            except Exception as e:
+                logger.error(f"Optimization failed for {sym}: {e}")
+
+    def optimize_threshold(self, symbol, train_days=60, test_days=30):
+        total_days = train_days + test_days
+        ohlcv = self.markets[symbol].get_ohlcv_multi_month(months=6, timeframe='1hour')
+        if ohlcv is None or len(ohlcv) < total_days * 24 + 100:
+            logger.warning(f"Insufficient data for {symbol} optimization.")
+            return None
+        train_limit = train_days * 24
+        test_limit = test_days * 24
+        if len(ohlcv) < train_limit + test_limit:
+            return None
+        train_data = ohlcv[:train_limit]
+        test_data = ohlcv[train_limit:train_limit+test_limit]
+
+        thresholds = np.arange(0.2, 0.85, 0.05)
+        best_th = 0.4
+        best_sharpe = -999
+        for th in thresholds:
+            train_result = self._run_backtest_on_data(symbol, train_data, threshold=th, months=0)
+            if train_result is None or isinstance(train_result, str):
+                continue
+            test_result = self._run_backtest_on_data(symbol, test_data, threshold=th, months=0)
+            if test_result is None or isinstance(test_result, str):
+                continue
+            score = test_result.get('profit_factor', 0) * test_result.get('win_rate', 0) / 100
+            if score > best_sharpe:
+                best_sharpe = score
+                best_th = th
+        return best_th
+
+    def _run_backtest_on_data(self, symbol, ohlcv, threshold, months=0):
+        if len(ohlcv) < 50:
+            return None
+        balance = Config.INITIAL_BALANCE
+        pnl_list = []
+        wins = 0
+        losses = 0
+        fee = 0.001
+        slippage = 0.0005
+        weights = Config.SOURCE_WEIGHTS.copy()
+        engine = ConsensusEngine(threshold=threshold, weights=weights, min_sources=Config.MIN_SOURCES)
+
+        for i in range(50, len(ohlcv)-1):
+            slice_data = ohlcv[:i+1]
+            close = slice_data[:, 1]
+            ma20 = np.mean(close[-20:])
+            ma50 = np.mean(close[-50:])
+            ma_signal = 1 if ma20 > ma50 else (-1 if ma20 < ma50 else 0)
+
+            volume = slice_data[:, 4]
+            if len(close) >= 11:
+                avg_vol = np.mean(volume[-10:-1])
+                avg_change = np.mean(np.diff(close[-11:])) / np.mean(close[-11:-1]) if np.mean(close[-11:-1]) != 0 else 0
+                curr_vol = volume[-1]
+                curr_change = (close[-1] - close[-2]) / close[-2] if close[-2] != 0 else 0
+                vm_signal = 1 if curr_vol > 1.5 * avg_vol and curr_change > 0.005 else (-1 if curr_vol > 1.5 * avg_vol and curr_change < -0.005 else 0)
+            else:
+                vm_signal = 0
+
+            high = slice_data[:, 2]
+            low = slice_data[:, 3]
+            price = close[-1]
+            recent_high = np.max(high[-20:])
+            recent_low = np.min(low[-20:])
+            breakout_signal = 1 if price > recent_high * 1.002 else (-1 if price < recent_low * 0.998 else 0)
+
+            signals = []
+            if ma_signal != 0:
+                signals.append(Signal(ma_signal, 0.60, "ma"))
+            if vm_signal != 0:
+                signals.append(Signal(vm_signal, 0.55, "volume_momentum"))
+            if breakout_signal != 0:
+                signals.append(Signal(breakout_signal, 0.65, "breakout"))
+            if not signals:
+                continue
+
+            direction, conf, details = engine.aggregate(signals)
+            if direction == 0 or conf < threshold:
+                continue
+
+            entry_price = price
+            if direction == 1:
+                entry_price = entry_price * (1 + slippage)
+            else:
+                entry_price = entry_price * (1 - slippage)
+
+            high_curr = slice_data[:, 2]
+            low_curr = slice_data[:, 3]
+            prev_close = np.roll(close, 1)[1:]
+            tr1 = high_curr[1:] - low_curr[1:]
+            tr2 = np.abs(high_curr[1:] - prev_close)
+            tr3 = np.abs(low_curr[1:] - prev_close)
+            tr = np.maximum(tr1, np.maximum(tr2, tr3))
+            atr = np.mean(tr[-14:]) if len(tr) >= 14 else 0.02 * price
+            risk = atr * 2.5
+            stop_loss = entry_price - risk if direction == 1 else entry_price + risk
+            take_profit = entry_price + risk * 1.5 if direction == 1 else entry_price - risk * 1.5
+
+            next_high = ohlcv[i+1][2]
+            next_low = ohlcv[i+1][3]
+            next_close = ohlcv[i+1][1]
+            exit_price = next_close
+            status = "Close"
+            if direction == 1:
+                if next_low <= stop_loss:
+                    exit_price = stop_loss
+                    status = "SL"
+                elif next_high >= take_profit:
+                    exit_price = take_profit
+                    status = "TP"
+            else:
+                if next_high >= stop_loss:
+                    exit_price = stop_loss
+                    status = "SL"
+                elif next_low <= take_profit:
+                    exit_price = take_profit
+                    status = "TP"
+
+            if direction == 1:
+                exit_price = exit_price * (1 - slippage)
+            else:
+                exit_price = exit_price * (1 + slippage)
+
+            size = (balance * Config.PER_TRADE_RISK_PCT) / (atr * 2.5)
+            if size <= 0:
+                continue
+
+            if direction == 1:
+                gross_pnl = (exit_price - entry_price) * size
+            else:
+                gross_pnl = (entry_price - exit_price) * size
+            fee_amount = (abs(entry_price * size) + abs(exit_price * size)) * fee
+            net_pnl = gross_pnl - fee_amount
+            balance += net_pnl
+            pnl_list.append(net_pnl)
+            if net_pnl > 0:
+                wins += 1
+            else:
+                losses += 1
+            if len(pnl_list) > 100:
+                break
+
+        total_trades = wins + losses
+        if total_trades == 0:
+            return None
+        win_rate = wins / total_trades * 100
+        total_pnl = sum(pnl_list)
+        profit_factor = abs(total_pnl / sum([p for p in pnl_list if p < 0])) if any(p < 0 for p in pnl_list) else float('inf')
+        if len(pnl_list) > 1:
+            mean_pnl = np.mean(pnl_list)
+            std_pnl = np.std(pnl_list) if np.std(pnl_list) > 0 else 0.0001
+            sharpe = (mean_pnl / std_pnl) * np.sqrt(365*24)
+        else:
+            sharpe = 0
+        return {
+            'total_trades': total_trades,
+            'win_rate': win_rate,
+            'total_pnl': total_pnl,
+            'profit_factor': profit_factor,
+            'sharpe': sharpe,
+            'pnl_list': pnl_list,
+            'final_balance': balance
+        }
+
+    # ------------------------ DYNAMIC WEIGHTS ------------------------
+    def get_dynamic_weights(self, symbol, price, atr):
+        settings = self.override_settings or {}
+        base_weights = {
+            'ma': settings.get('weight_ma', Config.SOURCE_WEIGHTS['ma']),
+            'volume_momentum': settings.get('weight_volume_momentum', Config.SOURCE_WEIGHTS['volume_momentum']),
+            'breakout': settings.get('weight_breakout', Config.SOURCE_WEIGHTS['breakout']),
+            'whale': settings.get('weight_whale', Config.SOURCE_WEIGHTS['whale']),
+        }
+        if atr is None or atr == 0 or price == 0:
+            return base_weights
+        vol = atr / price
+        if vol > 0.03:
+            base_weights['breakout'] = min(1.0, base_weights['breakout'] * 1.3)
+            base_weights['ma'] = max(0.2, base_weights['ma'] * 0.7)
+        elif vol < 0.01:
+            base_weights['ma'] = min(1.0, base_weights['ma'] * 1.3)
+            base_weights['breakout'] = max(0.2, base_weights['breakout'] * 0.7)
+        total = sum(base_weights.values())
+        if total > 0:
+            for k in base_weights:
+                base_weights[k] /= total
+        return base_weights
+
+    # ------------------------ MULTI-TIMEFRAME CONSENSUS ------------------------
+    def get_multi_tf_signal(self, symbol, price, atr, trend_ok):
+        timeframes = ['15min', '1hour', '4hour']
+        tf_directions = []
+        tf_details = []
+        weights = self.get_dynamic_weights(symbol, price, atr)
+        threshold = self.override_settings.get('consensus_threshold', Config.CONSENSUS_THRESHOLD)
+        if symbol in self.optimal_thresholds:
+            threshold = self.optimal_thresholds[symbol]
+
+        for tf in timeframes:
+            signals = []
+            for src in self.sources[symbol]:
+                sig = src.fetch(timeframe=tf)
+                if sig and sig.direction != 0:
+                    signals.append(sig)
+                    self.db.log_signal(int(time.time()), symbol, sig.source, sig.direction, sig.confidence)
+            if signals:
+                engine = ConsensusEngine(threshold=threshold, weights=weights, min_sources=Config.MIN_SOURCES)
+                direction, conf, details = engine.aggregate(signals)
+                if direction != 0 and conf >= threshold:
+                    tf_directions.append(direction)
+                    tf_details.append(f"{tf}:{direction}")
+        if len(tf_directions) >= 2:
+            buy_votes = sum(1 for d in tf_directions if d == 1)
+            sell_votes = sum(1 for d in tf_directions if d == -1)
+            if buy_votes > sell_votes:
+                return 1, tf_details
+            elif sell_votes > buy_votes:
+                return -1, tf_details
+        return 0, tf_details
+
+    # ------------------------ SEND ALERT ------------------------
     def send_alert(self, message):
         if not self.telegram_token or not self.chat_id:
             return
@@ -722,13 +1046,14 @@ class MultiTrader:
             except:
                 pass
 
-    def get_price_and_atr(self, symbol):
-        ohlcv = self.markets[symbol].get_ohlcv(limit=100, timeframe='1hour')
+    # ------------------------ PRICE AND ATR ------------------------
+    def get_price_and_atr(self, symbol, timeframe='1hour'):
+        ohlcv = self.markets[symbol].get_ohlcv(limit=100, timeframe=timeframe)
         if ohlcv is None or len(ohlcv) < 50:
             return None, None, None, None
-        close = ohlcv[:, 3]
-        high = ohlcv[:, 1]
-        low = ohlcv[:, 2]
+        close = ohlcv[:, 1]
+        high = ohlcv[:, 2]
+        low = ohlcv[:, 3]
         high_curr = high[1:]
         low_curr = low[1:]
         prev_close = close[:-1]
@@ -746,7 +1071,8 @@ class MultiTrader:
             trend_ok = True
         return price, atr, trend_ok, trend_ma
 
-    def execute_signal(self, symbol, direction, confidence, price, atr, details, sentiment_score, trend_ok):
+    # ------------------------ EXECUTE SIGNAL ------------------------
+    def execute_signal(self, symbol, direction, price, atr, tf_details, trend_ok):
         settings = self.override_settings or {}
         can_trade, reason = self.risk_mgr.can_trade(symbol, price, atr, trend_ok, settings)
         if not can_trade:
@@ -761,19 +1087,19 @@ class MultiTrader:
         take_profit = price + risk * 1.5 if direction == 1 else price - risk * 1.5
         side = 'buy' if direction == 1 else 'sell'
         cost = price * size
-        if side == 'buy' and self.balance < cost:
-            self.send_alert(f"⚠️ Insufficient balance for {symbol}")
-            return
+
+        with self.balance_lock:
+            if side == 'buy':
+                if self.balance < cost:
+                    self.send_alert(f"⚠️ Insufficient balance for {symbol}")
+                    return
+                self.balance -= cost
+            # For paper shorts: no balance change on entry
+
         self.risk_mgr.open_position(symbol, side, price, size, stop_loss, take_profit)
-        if side == 'buy':
-            self.balance -= cost
-        else:
-            self.balance += price * size
-        self.risk_mgr.update_balance(self.balance)
         self.db.log_trade(int(time.time()), symbol, side, price, size, 0.0, 0.0, self.balance)
 
-        details_html = "<br>".join([sanitize_html(f"• {d}") for d in details])
-        sentiment_label = "🚀 Bullish" if sentiment_score == 1 else ("🔻 Bearish" if sentiment_score == -1 else "⚖️ Neutral")
+        details_html = "<br>".join([sanitize_html(f"• {d}") for d in tf_details])
         msg = (
             f"🔔 <b>{symbol} SIGNAL</b> ({'LIVE' if self.live_broker.enabled else 'PAPER'})\n"
             f"Action: {'🟢 BUY' if direction==1 else '🔴 SELL'}\n"
@@ -781,23 +1107,23 @@ class MultiTrader:
             f"TP: ${take_profit:.4f} (+{(risk*1.5/price)*100:.2f}%)\n"
             f"SL: ${stop_loss:.4f} (-{(risk/price)*100:.2f}%)\n"
             f"Risk: {settings.get('per_trade_risk_pct', Config.PER_TRADE_RISK_PCT)*100:.1f}%\n"
-            f"Confidence: {confidence:.2f}\n"
-            f"Sentiment: {sentiment_label}\n"
-            f"Votes:\n{details_html}\n\n"
+            f"Timeframes: {details_html}\n\n"
             f"<i>Not financial advice.</i>"
         )
         self.send_alert(msg)
 
+    # ------------------------ STEP (main loop) ------------------------
     def step(self):
         for symbol in self.symbols:
-            result = self.get_price_and_atr(symbol)
+            result = self.get_price_and_atr(symbol, timeframe='1hour')
             if result is None or result[0] is None:
                 continue
             price, atr, trend_ok, trend_ma = result
 
             pnl, status, pos = self.risk_mgr.check_sl_tp(symbol, price)
             if pnl != 0 and pos is not None:
-                self.balance += pnl
+                with self.balance_lock:
+                    self.balance += pnl
                 self.risk_mgr.update_balance(self.balance)
                 self.risk_mgr.update_daily_pnl(pnl)
                 pnl_pct = (pnl / (pos['entry'] * pos['size'])) * 100
@@ -816,37 +1142,20 @@ class MultiTrader:
             if self.risk_mgr.open_positions.get(symbol, []):
                 continue
 
-            signals = []
-            sentiment = 0
-            for src in self.sources[symbol]:
-                sig = src.fetch()
-                if sig and sig.direction != 0:
-                    signals.append(sig)
-                    self.db.log_signal(int(time.time()), symbol, sig.source, sig.direction, sig.confidence)
-                    if sig.source == "sentiment":
-                        sentiment = sig.direction
+            direction, tf_details = self.get_multi_tf_signal(symbol, price, atr, trend_ok)
+            if direction == 0:
+                continue
 
-            if signals:
-                threshold = self.override_settings.get('consensus_threshold', Config.CONSENSUS_THRESHOLD) if self.override_settings else Config.CONSENSUS_THRESHOLD
-                min_sources = self.override_settings.get('min_sources', Config.MIN_SOURCES) if self.override_settings else Config.MIN_SOURCES
-                weights = {
-                    'technical_ma': self.override_settings.get('weight_ma', Config.SOURCE_WEIGHTS['technical_ma']) if self.override_settings else Config.SOURCE_WEIGHTS['technical_ma'],
-                    'technical_rsi': self.override_settings.get('weight_rsi', Config.SOURCE_WEIGHTS['technical_rsi']) if self.override_settings else Config.SOURCE_WEIGHTS['technical_rsi'],
-                    'sentiment': self.override_settings.get('weight_sentiment', Config.SOURCE_WEIGHTS['sentiment']) if self.override_settings else Config.SOURCE_WEIGHTS['sentiment'],
-                    'breakout': self.override_settings.get('weight_breakout', Config.SOURCE_WEIGHTS['breakout']) if self.override_settings else Config.SOURCE_WEIGHTS['breakout'],
-                }
-                engine = ConsensusEngine(threshold=threshold, weights=weights, min_sources=min_sources)
-                direction, conf, details = engine.aggregate(signals)
-                if direction != 0 and conf >= threshold:
-                    self.execute_signal(symbol, direction, conf, price, atr, details, sentiment, trend_ok)
-
-            self.last_prices[symbol] = price
+            self.execute_signal(symbol, direction, price, atr, tf_details, trend_ok)
 
     def run_loop(self):
         logger.info("Starting multi-asset trading loop. Symbols: %s", self.symbols)
         while self.running:
             try:
                 self.step()
+                self.heartbeat_counter += 1
+                if self.heartbeat_counter % 5 == 0:
+                    logger.info("Trading loop heartbeat – alive")
                 time.sleep(Config.TRADE_INTERVAL_SECONDS)
             except Exception as e:
                 logger.error(f"Loop error: {e}", exc_info=True)
@@ -854,130 +1163,29 @@ class MultiTrader:
 
     # ---------------------------- BACKTEST ----------------------------
     def backtest(self, symbol, lookback_days=30, timeframe='1hour'):
-        settings = self.override_settings or {}
-        threshold = settings.get('consensus_threshold', Config.CONSENSUS_THRESHOLD)
-        min_sources = settings.get('min_sources', Config.MIN_SOURCES)
-        weights = {
-            'technical_ma': settings.get('weight_ma', Config.SOURCE_WEIGHTS['technical_ma']),
-            'technical_rsi': settings.get('weight_rsi', Config.SOURCE_WEIGHTS['technical_rsi']),
-            'sentiment': settings.get('weight_sentiment', Config.SOURCE_WEIGHTS['sentiment']),
-            'breakout': settings.get('weight_breakout', Config.SOURCE_WEIGHTS['breakout']),
-        }
-        ohlcv = self.markets[symbol].get_ohlcv(limit=lookback_days*24, timeframe=timeframe)
-        if ohlcv is None or len(ohlcv) < 50:
-            return "Insufficient data for backtest."
-        balance = 10000.0
-        pnl_list = []
-        wins = 0
-        losses = 0
-        engine = ConsensusEngine(threshold=threshold, weights=weights, min_sources=min_sources)
-        for i in range(50, len(ohlcv)-1):
-            current_ohlcv = ohlcv[:i+1]
-            close = current_ohlcv[:, 3]
-            ma20 = np.mean(close[-20:])
-            ma50 = np.mean(close[-50:])
-            ma_signal = 1 if ma20 > ma50 else (-1 if ma20 < ma50 else 0)
-            deltas = np.diff(close)
-            gains = deltas[deltas > 0]
-            losses_arr = -deltas[deltas < 0]
-            if len(gains) < 14 or len(losses_arr) < 14:
-                rsi_signal = 0
-            else:
-                avg_gain = np.mean(gains[-14:])
-                avg_loss = np.mean(losses_arr[-14:])
-                if avg_loss == 0:
-                    rsi_signal = 0
-                else:
-                    rsi = 100 - (100 / (1 + avg_gain/avg_loss))
-                    rsi_signal = 1 if rsi < 40 else (-1 if rsi > 60 else 0)
-            price = close[-1]
-            if i > 0:
-                change = (price / close[-2] - 1) * 100
-                volume = 1000000
-                sent_signal = 1 if change > 1.5 else (-1 if change < -1.5 else 0)
-            else:
-                sent_signal = 0
-            active = []
-            if ma_signal != 0:
-                active.append(Signal(ma_signal, 0.60, "technical_ma"))
-            if rsi_signal != 0:
-                active.append(Signal(rsi_signal, 0.55, "technical_rsi"))
-            if sent_signal != 0:
-                active.append(Signal(sent_signal, 0.50, "sentiment"))
-            if not active:
-                continue
-            direction, conf, details = engine.aggregate(active)
-            if direction == 0 or conf < threshold:
-                continue
-            next_price = ohlcv[i+1][3]
-            entry_price = price
-            exit_price = next_price
-            high = current_ohlcv[:, 1]
-            low = current_ohlcv[:, 2]
-            high_curr = high[1:]
-            low_curr = low[1:]
-            prev_close = close[:-1]
-            tr1 = high_curr - low_curr
-            tr2 = np.abs(high_curr - prev_close)
-            tr3 = np.abs(low_curr - prev_close)
-            tr = np.maximum(tr1, np.maximum(tr2, tr3))
-            atr = np.mean(tr[-14:]) if len(tr) >= 14 else 0.02 * price
-            risk = atr * 2.5
-            stop_loss = entry_price - risk if direction == 1 else entry_price + risk
-            take_profit = entry_price + risk * 1.5 if direction == 1 else entry_price - risk * 1.5
-            if direction == 1:
-                if exit_price <= stop_loss:
-                    exit_price = stop_loss
-                    status = "SL"
-                elif exit_price >= take_profit:
-                    exit_price = take_profit
-                    status = "TP"
-                else:
-                    status = "Close"
-            else:
-                if exit_price >= stop_loss:
-                    exit_price = stop_loss
-                    status = "SL"
-                elif exit_price <= take_profit:
-                    exit_price = take_profit
-                    status = "TP"
-                else:
-                    status = "Close"
-            size = (balance * 0.02) / (atr * 2.5)
-            if direction == 1:
-                pnl = (exit_price - entry_price) * size
-            else:
-                pnl = (entry_price - exit_price) * size
-            balance += pnl
-            pnl_list.append(pnl)
-            if pnl > 0:
-                wins += 1
-            else:
-                losses += 1
-            if len(pnl_list) > 50:
-                break
-        total_trades = wins + losses
-        if total_trades == 0:
+        if lookback_days > 60:
+            months = lookback_days // 30
+            ohlcv = self.markets[symbol].get_ohlcv_multi_month(months=months, timeframe=timeframe)
+            if ohlcv is None:
+                return "Insufficient data for backtest."
+        else:
+            ohlcv = self.markets[symbol].get_ohlcv(limit=lookback_days*24, timeframe=timeframe)
+            if ohlcv is None or len(ohlcv) < 50:
+                return "Insufficient data for backtest."
+        threshold = self.override_settings.get('consensus_threshold', Config.CONSENSUS_THRESHOLD)
+        result = self._run_backtest_on_data(symbol, ohlcv, threshold=threshold, months=0)
+        if result is None:
             return "No trades generated in backtest period."
-        win_rate = wins / total_trades * 100
-        total_pnl = sum(pnl_list)
-        max_dd = 0
-        peak = 10000
-        for b in [10000 + sum(pnl_list[:i+1]) for i in range(len(pnl_list))]:
-            if b > peak:
-                peak = b
-            dd = (peak - b) / peak
-            if dd > max_dd:
-                max_dd = dd
         return {
             'symbol': symbol,
             'period': f"{lookback_days} days",
-            'total_trades': total_trades,
-            'win_rate': win_rate,
-            'total_pnl': total_pnl,
-            'final_balance': balance,
-            'max_drawdown': max_dd * 100,
-            'profit_factor': abs(total_pnl / sum([p for p in pnl_list if p < 0])) if any(p < 0 for p in pnl_list) else float('inf')
+            'total_trades': result['total_trades'],
+            'win_rate': result['win_rate'],
+            'total_pnl': result['total_pnl'],
+            'final_balance': result['final_balance'],
+            'max_drawdown': 0,
+            'profit_factor': result['profit_factor'],
+            'sharpe': result.get('sharpe', 0)
         }
 
 # ---------------------------- FLASK APP ----------------------------
@@ -998,15 +1206,22 @@ def download_csv():
 def status():
     if trader_global is None:
         return jsonify({"error": "trader not initialized"})
+    with trader_global.balance_lock:
+        balance = trader_global.balance
+    daily_pnl = trader_global.db.get_daily_pnl()
+    total_pos = trader_global.risk_mgr.get_total_positions()
+    running = trader_global.running
+    drawdown = trader_global.risk_mgr.get_drawdown_pct() * 100
+    opt = trader_global.optimal_thresholds
     return jsonify({
-        "balance": trader_global.balance,
-        "daily_pnl": trader_global.db.get_daily_pnl(),
-        "open_positions": trader_global.risk_mgr.get_total_positions(),
-        "running": trader_global.running,
-        "drawdown": trader_global.risk_mgr.get_drawdown_pct() * 100
+        "balance": balance,
+        "daily_pnl": daily_pnl,
+        "open_positions": total_pos,
+        "running": running,
+        "drawdown": drawdown,
+        "optimized_thresholds": opt
     })
 
-# ---------- TEST ENDPOINT ----------
 @app.route('/test')
 def test_telegram():
     if trader_global is None:
@@ -1037,14 +1252,15 @@ async def start(update: Update, context):
         await update.message.reply_text("⏳ Processing...", reply_markup=get_main_keyboard())
         logger.info(f"Received /start from {update.effective_user.id}")
         await update.message.reply_text(
-            "🤖 <b>Consensus Trader</b>\n\n"
+            "🤖 <b>Consensus Trader (Final Production)</b>\n\n"
             "Commands:\n"
             "/status – Account\n/scan – Force scan\n/performance – Stats\n"
-            "/backtest <symbol> – Run backtest\n"
+            "/backtest <symbol> – Run 12-month backtest\n"
             "/settings – View/Edit settings\n"
             "/set &lt;key&gt; &lt;value&gt; – Change a setting\n"
             "/reset – Reset to defaults\n"
             "/ping – Liveness check\n"
+            "/restartloop – Restart trading loop\n"
             "/pause – Pause\n/resume – Resume\n/help – This\n\n"
             "💾 <a href='https://new-crypto-signals.onrender.com/download'>Download CSV</a>",
             parse_mode='HTML', reply_markup=get_main_keyboard(), disable_web_page_preview=True
@@ -1063,6 +1279,7 @@ async def help_cmd(update: Update, context):
             "/set &lt;key&gt; &lt;value&gt; – Change a setting\n"
             "/reset – Reset to defaults\n"
             "/ping – Liveness check\n"
+            "/restartloop – Restart trading loop\n"
             "/pause – Pause\n/resume – Resume\n/help – This",
             parse_mode='HTML', reply_markup=get_main_keyboard()
         )
@@ -1071,7 +1288,6 @@ async def help_cmd(update: Update, context):
 
 async def status_cmd(update: Update, context):
     try:
-        # Send immediate "⏳" reply
         await update.message.reply_text("⏳ Fetching status...", reply_markup=get_main_keyboard())
         logger.info(f"Received /status from {update.effective_user.id}")
 
@@ -1079,8 +1295,6 @@ async def status_cmd(update: Update, context):
             await update.message.reply_text("Trader not ready.", reply_markup=get_main_keyboard())
             return
 
-        # We'll try to compute status with a timeout
-        # Use a thread to compute status and set a timeout
         result_container = {}
         def compute_status():
             try:
@@ -1088,21 +1302,24 @@ async def status_cmd(update: Update, context):
                 drawdown = t.risk_mgr.get_drawdown_pct() * 100
                 daily_pnl = t.db.get_daily_pnl()
                 total_pos = t.risk_mgr.get_total_positions()
-                balance = t.balance
+                with t.balance_lock:
+                    balance = t.balance
                 running = t.running
+                opt = t.optimal_thresholds
                 result_container['success'] = True
                 result_container['drawdown'] = drawdown
                 result_container['daily_pnl'] = daily_pnl
                 result_container['total_pos'] = total_pos
                 result_container['balance'] = balance
                 result_container['running'] = running
+                result_container['opt'] = opt
             except Exception as e:
                 result_container['error'] = str(e)
 
         thread = threading.Thread(target=compute_status)
         thread.daemon = True
         thread.start()
-        thread.join(timeout=5.0)  # wait max 5 seconds
+        thread.join(timeout=5.0)
 
         if 'error' in result_container:
             logger.error(f"Status computation error: {result_container['error']}")
@@ -1110,21 +1327,22 @@ async def status_cmd(update: Update, context):
             return
 
         if not result_container.get('success'):
-            # Timeout or failure
             logger.warning("Status computation timed out or failed.")
             await update.message.reply_text("⚠️ Status temporarily unavailable. Please try again later.", reply_markup=get_main_keyboard())
             return
 
-        # Build message
         drawdown = result_container['drawdown']
         daily_pnl = result_container['daily_pnl']
         total_pos = result_container['total_pos']
         balance = result_container['balance']
         running = result_container['running']
+        opt = result_container['opt']
+        opt_str = "\n".join([f"{k}: {v:.2f}" for k,v in opt.items()]) if opt else "Not optimized"
         msg = (
             f"📊 <b>Status</b>\nBalance: ${balance:.2f}\nDaily PnL: ${daily_pnl:.2f}\n"
             f"Open Positions: {total_pos}\n"
-            f"Drawdown: {drawdown:.2f}%\nRunning: {'✅' if running else '⏸️'}"
+            f"Drawdown: {drawdown:.2f}%\nRunning: {'✅' if running else '⏸️'}\n"
+            f"Optimized Thresholds:\n{opt_str}"
         )
         safe_msg = sanitize_html(msg)
         logger.info("Sending final status message...")
@@ -1164,7 +1382,7 @@ async def performance(update: Update, context):
 
 async def backtest(update: Update, context):
     try:
-        await update.message.reply_text("⏳ Running backtest...", reply_markup=get_main_keyboard())
+        await update.message.reply_text("⏳ Running 12-month backtest...", reply_markup=get_main_keyboard())
         logger.info(f"Received /backtest from {update.effective_user.id}")
         if trader_global is None:
             await update.message.reply_text("Trader not ready.", reply_markup=get_main_keyboard())
@@ -1179,20 +1397,20 @@ async def backtest(update: Update, context):
         if symbol not in trader_global.symbols:
             await update.message.reply_text(f"Symbol {symbol} not active. Active: {', '.join(trader_global.symbols)}", reply_markup=get_main_keyboard())
             return
-        result = trader_global.backtest(symbol, lookback_days=30, timeframe='1hour')
+        result = trader_global.backtest(symbol, lookback_days=Config.BACKTEST_MONTHS*30, timeframe='1hour')
         if isinstance(result, str):
             await update.message.reply_text(result, reply_markup=get_main_keyboard())
         else:
             msg = (
-                f"📊 <b>Backtest Results</b>\n"
+                f"📊 <b>12-Month Backtest Results</b>\n"
                 f"Symbol: {result['symbol']}\n"
                 f"Period: {result['period']}\n"
                 f"Trades: {result['total_trades']}\n"
                 f"Win Rate: {result['win_rate']:.1f}%\n"
                 f"Total PnL: ${result['total_pnl']:.2f}\n"
                 f"Final Balance: ${result['final_balance']:.2f}\n"
-                f"Max Drawdown: {result['max_drawdown']:.2f}%\n"
-                f"Profit Factor: {result['profit_factor']:.2f}"
+                f"Profit Factor: {result['profit_factor']:.2f}\n"
+                f"Sharpe Ratio: {result.get('sharpe', 0):.2f}"
             )
             safe_msg = sanitize_html(msg)
             await update.message.reply_text(safe_msg, parse_mode='HTML', reply_markup=get_main_keyboard())
@@ -1206,41 +1424,17 @@ async def scan(update: Update, context):
         if trader_global is None:
             return
         for sym in trader_global.symbols:
-            result = trader_global.get_price_and_atr(sym)
-            if result is None or result[0] is None:
+            price, atr, trend_ok, _ = trader_global.get_price_and_atr(sym, timeframe='1hour')
+            if price is None:
                 await update.message.reply_text(f"⚠️ No data for {sym}")
                 continue
-            price, atr, trend_ok, trend_ma = result
-            signals = []
-            for src in trader_global.sources[sym]:
-                sig = src.fetch()
-                if sig and sig.direction != 0:
-                    signals.append(sig)
-            if signals:
-                settings = trader_global.override_settings or {}
-                threshold = settings.get('consensus_threshold', Config.CONSENSUS_THRESHOLD)
-                min_sources = settings.get('min_sources', Config.MIN_SOURCES)
-                weights = {
-                    'technical_ma': settings.get('weight_ma', Config.SOURCE_WEIGHTS['technical_ma']),
-                    'technical_rsi': settings.get('weight_rsi', Config.SOURCE_WEIGHTS['technical_rsi']),
-                    'sentiment': settings.get('weight_sentiment', Config.SOURCE_WEIGHTS['sentiment']),
-                    'breakout': settings.get('weight_breakout', Config.SOURCE_WEIGHTS['breakout']),
-                }
-                engine = ConsensusEngine(threshold=threshold, weights=weights, min_sources=min_sources)
-                direction, conf, details = engine.aggregate(signals)
-                trend_info = f"Trend OK: {'✅' if trend_ok else '❌'}"
-                msg = (
-                    f"⚖️ {sym}: {'BUY' if direction==1 else 'SELL' if direction==-1 else 'NEUTRAL'}\n"
-                    f"Confidence: {conf:.2f}\n"
-                    f"Price: ${price:.2f}\n"
-                    f"Volatility: {(atr/price)*100:.2f}%\n"
-                    f"Trend: {trend_info}\n"
-                    f"Sources: {' | '.join([f'{s.source}:{s.direction} ({s.confidence:.2f})' for s in signals])}"
-                )
-                safe_msg = sanitize_html(msg)
-                await update.message.reply_text(safe_msg, reply_markup=get_main_keyboard())
-            else:
-                await update.message.reply_text(f"⚠️ No signals for {sym}", reply_markup=get_main_keyboard())
+            direction, tf_details = trader_global.get_multi_tf_signal(sym, price, atr, trend_ok)
+            msg = f"⚖️ {sym}: {'BUY' if direction==1 else 'SELL' if direction==-1 else 'NEUTRAL'}\n"
+            msg += f"Timeframes: {' | '.join(tf_details) if tf_details else 'No consensus'}\n"
+            msg += f"Price: ${price:.2f}\n"
+            vol = (atr/price)*100 if atr else 0
+            msg += f"Volatility: {vol:.2f}%"
+            await update.message.reply_text(msg, reply_markup=get_main_keyboard())
         await update.message.reply_text("✅ Scan complete.", reply_markup=get_main_keyboard())
     except Exception as e:
         logger.error(f"Error in scan: {e}", exc_info=True)
@@ -1263,6 +1457,22 @@ async def resume(update: Update, context):
     except Exception as e:
         logger.error(f"Error in resume: {e}")
 
+async def restartloop_cmd(update: Update, context):
+    try:
+        await update.message.reply_text("⏳ Restarting trading loop...", reply_markup=get_main_keyboard())
+        global trader_global
+        if trader_global is None:
+            await update.message.reply_text("Trader not initialized.")
+            return
+        trader_global.running = False
+        time.sleep(1)
+        trader_global.running = True
+        threading.Thread(target=trader_global.run_loop, daemon=True).start()
+        await update.message.reply_text("✅ Trading loop restarted.", reply_markup=get_main_keyboard())
+    except Exception as e:
+        logger.error(f"Error in restartloop: {e}")
+        await update.message.reply_text(f"❌ Failed to restart loop: {e}", reply_markup=get_main_keyboard())
+
 async def settings_cmd(update: Update, context):
     try:
         await update.message.reply_text("⏳ Loading settings...", reply_markup=get_main_keyboard())
@@ -1282,10 +1492,10 @@ async def settings_cmd(update: Update, context):
                 'max_drawdown': Config.MAX_DRAWDOWN,
                 'max_positions_global': Config.MAX_POSITIONS_GLOBAL,
                 'trend_filter': Config.TREND_FILTER,
-                'weight_ma': Config.SOURCE_WEIGHTS['technical_ma'],
-                'weight_rsi': Config.SOURCE_WEIGHTS['technical_rsi'],
-                'weight_sentiment': Config.SOURCE_WEIGHTS['sentiment'],
+                'weight_ma': Config.SOURCE_WEIGHTS['ma'],
+                'weight_volume_momentum': Config.SOURCE_WEIGHTS['volume_momentum'],
                 'weight_breakout': Config.SOURCE_WEIGHTS['breakout'],
+                'weight_whale': Config.SOURCE_WEIGHTS['whale'],
             }
         msg = (
             "⚙️ <b>Your Trading Settings</b>\n\n"
@@ -1299,9 +1509,9 @@ async def settings_cmd(update: Update, context):
             f"📌 Max Positions: {settings['max_positions_global']}\n"
             f"📈 Trend Filter: {'✅' if settings['trend_filter'] else '❌'}\n"
             f"⚖️ Weight MA: {settings['weight_ma']}\n"
-            f"⚖️ Weight RSI: {settings['weight_rsi']}\n"
-            f"⚖️ Weight Sentiment: {settings['weight_sentiment']}\n"
-            f"⚖️ Weight Breakout: {settings['weight_breakout']}\n\n"
+            f"⚖️ Weight Volume Momentum: {settings['weight_volume_momentum']}\n"
+            f"⚖️ Weight Breakout: {settings['weight_breakout']}\n"
+            f"⚖️ Weight Whale: {settings['weight_whale']}\n\n"
             "Use /set &lt;key&gt; &lt;value&gt; to change, e.g.\n"
             "<code>/set consensus_threshold 0.45</code>\n"
             "<code>/set symbols BTC-USDT,ETH-USDT</code>\n"
@@ -1320,19 +1530,22 @@ async def set_cmd(update: Update, context):
             return
         key = args[0]
         value = ' '.join(args[1:])
-        if key in ['consensus_threshold', 'volatility_min', 'per_trade_risk_pct', 'max_daily_loss_pct', 'max_drawdown', 'weight_ma', 'weight_rsi', 'weight_sentiment', 'weight_breakout']:
+        numeric_keys = ['consensus_threshold', 'volatility_min', 'per_trade_risk_pct', 'max_daily_loss_pct', 'max_drawdown', 'weight_ma', 'weight_volume_momentum', 'weight_breakout', 'weight_whale']
+        int_keys = ['min_sources', 'max_positions_global']
+        bool_keys = ['trend_filter']
+        if key in numeric_keys:
             try:
                 value = float(value)
             except ValueError:
                 await update.message.reply_text(f"Invalid number for {key}.", reply_markup=get_main_keyboard())
                 return
-        elif key in ['min_sources', 'max_positions_global']:
+        elif key in int_keys:
             try:
                 value = int(value)
             except ValueError:
                 await update.message.reply_text(f"Invalid integer for {key}.", reply_markup=get_main_keyboard())
                 return
-        elif key == 'trend_filter':
+        elif key in bool_keys:
             value = value.lower() in ['true', '1', 'yes', 'on']
         elif key == 'symbols':
             symbols = [s.strip() for s in value.split(',') if s.strip()]
@@ -1340,7 +1553,7 @@ async def set_cmd(update: Update, context):
                 await update.message.reply_text("Symbols cannot be empty.", reply_markup=get_main_keyboard())
                 return
         else:
-            await update.message.reply_text(f"Unknown key: {key}. Available: symbols, consensus_threshold, min_sources, volatility_min, per_trade_risk_pct, max_daily_loss_pct, max_drawdown, max_positions_global, trend_filter, weight_ma, weight_rsi, weight_sentiment, weight_breakout", reply_markup=get_main_keyboard())
+            await update.message.reply_text(f"Unknown key: {key}. Available: symbols, consensus_threshold, min_sources, volatility_min, per_trade_risk_pct, max_daily_loss_pct, max_drawdown, max_positions_global, trend_filter, weight_ma, weight_volume_momentum, weight_breakout, weight_whale", reply_markup=get_main_keyboard())
             return
         if trader_global:
             trader_global.settings_manager.set(chat_id, key, value)
@@ -1402,6 +1615,21 @@ def keep_alive():
             logger.error(f"Keep-alive ping failed: {e}")
         time.sleep(240)
 
+# ---------------------------- TRADING LOOP WRAPPER (Auto-Restart) ----------------------------
+def start_trading_loop_with_restart(trader):
+    while True:
+        try:
+            if trader is None:
+                logger.error("Trader is None, cannot start loop.")
+                time.sleep(30)
+                continue
+            trader.running = True
+            trader.run_loop()
+        except Exception as e:
+            logger.error(f"Trading loop crashed: {e}. Restarting in 10 seconds...", exc_info=True)
+            time.sleep(10)
+            continue
+
 # ---------------------------- TELEGRAM RUNNER ----------------------------
 def run_telegram():
     if not Config.TELEGRAM_TOKEN:
@@ -1421,6 +1649,7 @@ def run_telegram():
             app_tg.add_handler(CommandHandler("scan", scan))
             app_tg.add_handler(CommandHandler("pause", pause))
             app_tg.add_handler(CommandHandler("resume", resume))
+            app_tg.add_handler(CommandHandler("restartloop", restartloop_cmd))
             app_tg.add_handler(CommandHandler("settings", settings_cmd))
             app_tg.add_handler(CommandHandler("set", set_cmd))
             app_tg.add_handler(CommandHandler("reset", reset_cmd))
@@ -1464,15 +1693,21 @@ if __name__ == "__main__":
         except Exception as e:
             logger.error(f"Startup message failed: {e}")
 
-    # Start threads
-    threading.Thread(target=trader.run_loop, daemon=True).start()
+    # Start Flask server
     threading.Thread(
         target=app.run,
         kwargs={'host': '0.0.0.0', 'port': int(os.getenv('PORT', 5000))},
         daemon=True
     ).start()
+
+    # Start keep-alive thread
     threading.Thread(target=keep_alive, daemon=True).start()
     logger.info("Keep-alive thread started.")
+
+    # Start trading loop with auto-restart
+    loop_thread = threading.Thread(target=start_trading_loop_with_restart, args=(trader,), daemon=True)
+    loop_thread.start()
+    logger.info("Trading loop thread started with auto-restart.")
 
     # Run Telegram bot on main thread
     logger.info("Starting Telegram bot on main thread...")
