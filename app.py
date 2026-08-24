@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Multi-Asset Consensus Trading Bot – FINAL FIXED (PID + Conflict)
+Multi-Asset Consensus Trading Bot – FINAL FIXED (Low Threshold, Multi‑TF=1, Telegram stable)
 """
 
 import os
@@ -42,40 +42,32 @@ def remove_pid():
 def is_process_running(pid: int) -> bool:
     """Check if a process with given PID is running (cross-platform)."""
     try:
-        # Try using psutil (more reliable)
         import psutil
         if psutil.pid_exists(pid):
             proc = psutil.Process(pid)
-            # Check if it's a Python process (optional)
             if 'python' in proc.name().lower() or 'python' in ' '.join(proc.cmdline()).lower():
                 return True
             return False
         return False
     except ImportError:
-        # Fallback to tasklist on Windows, ps on Unix
         if sys.platform == 'win32':
             try:
                 output = subprocess.check_output(f'tasklist /FI "PID eq {pid}"', shell=True, text=True)
-                # tasklist output includes the process name; check for Python
-                if str(pid) in output:
-                    # Check if it's a Python process
-                    if 'python' in output.lower():
-                        return True
+                if str(pid) in output and 'python' in output.lower():
+                    return True
                 return False
             except Exception:
                 return False
         else:
             try:
                 os.kill(pid, 0)
-                # Also check if it's a Python process (optional)
-                # Could read /proc but skip for simplicity
                 return True
             except OSError:
                 return False
 
 def check_and_clean_pid():
     if not os.path.exists(PID_FILE):
-        return True  # no PID file, safe to start
+        return True
     try:
         with open(PID_FILE, 'r') as f:
             pid_str = f.read().strip()
@@ -104,7 +96,7 @@ if not check_and_clean_pid():
 write_pid()
 atexit.register(remove_pid)
 
-# ---------------------------- CONFIGURATION ----------------------------
+# ---------------------------- CONFIGURATION (FIXED: Lower threshold, TF=1) ----------------------------
 class Config:
     SYMBOLS = [s.strip().replace('/', '-') for s in os.getenv("SYMBOLS", "BTC-USDT,ETH-USDT,SOL-USDT,AVAX-USDT,POL-USDT").split(',') if s.strip()]
     INITIAL_BALANCE = float(os.getenv("INITIAL_BALANCE", "10000.0"))
@@ -113,7 +105,7 @@ class Config:
     PER_TRADE_RISK_PCT = float(os.getenv("PER_TRADE_RISK_PCT", "0.02"))
     MAX_DAILY_LOSS_PCT = float(os.getenv("MAX_DAILY_LOSS_PCT", "0.05"))
     MAX_DRAWDOWN = float(os.getenv("MAX_DRAWDOWN", "0.10"))
-    CONSENSUS_THRESHOLD = float(os.getenv("CONSENSUS_THRESHOLD", "0.40"))
+    CONSENSUS_THRESHOLD = float(os.getenv("CONSENSUS_THRESHOLD", "0.25"))  # lowered from 0.4
     MIN_SOURCES = int(os.getenv("MIN_SOURCES", "1"))
     CONSECUTIVE_LOSS_LIMIT = int(os.getenv("CONSECUTIVE_LOSS_LIMIT", "3"))
     VOLATILITY_MIN = float(os.getenv("VOLATILITY_MIN", "0.005"))
@@ -129,7 +121,7 @@ class Config:
     OPTIMIZE_TRAIN_DAYS = int(os.getenv("OPTIMIZE_TRAIN_DAYS", "60"))
     OPTIMIZE_TEST_DAYS = int(os.getenv("OPTIMIZE_TEST_DAYS", "30"))
     BACKTEST_MONTHS = int(os.getenv("BACKTEST_MONTHS", "12"))
-    MULTI_TF_REQUIRED = int(os.getenv("MULTI_TF_REQUIRED", "2"))
+    MULTI_TF_REQUIRED = int(os.getenv("MULTI_TF_REQUIRED", "1"))  # changed from 2
 
     EXCHANGE_NAME = os.getenv("EXCHANGE_NAME", "")
     EXCHANGE_API_KEY = os.getenv("EXCHANGE_API_KEY", "")
@@ -178,7 +170,7 @@ def get_kucoin_symbols() -> Set[str]:
         logger.error(f"Failed to fetch KuCoin symbols: {e}")
     return set()
 
-# ---------------------------- DATABASE (unchanged) ----------------------------
+# ---------------------------- DATABASE ----------------------------
 class TradeDB:
     def __init__(self, db_file=Config.DB_FILE):
         self.conn = sqlite3.connect(db_file, check_same_thread=False)
@@ -260,7 +252,7 @@ class TradeDB:
     def close(self):
         self.conn.close()
 
-# ---------------------------- SETTINGS MANAGER (unchanged) ----------------------------
+# ---------------------------- SETTINGS MANAGER ----------------------------
 class SettingsManager:
     def __init__(self, db: TradeDB):
         self.db = db
@@ -347,7 +339,7 @@ class SettingsManager:
             self.db.cursor.execute("DELETE FROM user_settings WHERE chat_id = ?", (chat_id,))
             self.db.conn.commit()
 
-# ---------------------------- CSV PERFORMANCE LOGGER (unchanged) ----------------------------
+# ---------------------------- CSV PERFORMANCE LOGGER ----------------------------
 class PerformanceLogger:
     def __init__(self, csv_file=Config.CSV_FILE):
         self.csv_file = csv_file
@@ -429,7 +421,7 @@ class PerformanceLogger:
             logger.error(f"CSV read error: {e}")
             return None
 
-# ---------------------------- MARKET DATA (unchanged) ----------------------------
+# ---------------------------- MARKET DATA ----------------------------
 class MarketData:
     def __init__(self, symbol):
         self.symbol = symbol
@@ -550,7 +542,7 @@ class MarketData:
             'low': float(data.get('low', 0)),
         }
 
-# ---------------------------- SIGNAL SOURCES (unchanged) ----------------------------
+# ---------------------------- SIGNAL SOURCES ----------------------------
 class Signal:
     def __init__(self, direction, confidence, source, timestamp=None):
         self.direction = direction
@@ -642,7 +634,7 @@ class WhaleSource(SignalSource):
             return Signal(-1, 0.60, "whale")
         return Signal(0, 0.0, "whale")
 
-# ---------------------------- CONSENSUS ENGINE ----------------------------
+# ---------------------------- CONSENSUS ENGINE (FIXED confidence) ----------------------------
 class ConsensusEngine:
     def __init__(self, threshold=Config.CONSENSUS_THRESHOLD, weights=Config.SOURCE_WEIGHTS, min_sources=Config.MIN_SOURCES):
         self.threshold = threshold
@@ -662,6 +654,7 @@ class ConsensusEngine:
         if total_w == 0:
             return 0, 0.0, []
         avg_dir = sum_dir / total_w
+        # Confidence: weighted average of confidences
         conf_num = 0.0
         conf_den = 0.0
         for sig in active:
@@ -677,7 +670,7 @@ class ConsensusEngine:
         details = [f"{sig.source}:{sig.direction} ({sig.confidence:.2f})" for sig in active]
         return direction, avg_conf, details
 
-# ---------------------------- RISK MANAGER (unchanged) ----------------------------
+# ---------------------------- RISK MANAGER ----------------------------
 class RiskManager:
     def __init__(self, initial_balance, config):
         self.initial_balance = initial_balance
@@ -805,7 +798,7 @@ class LiveBroker:
         logger.info(f"[LIVE] {side} {size} {symbol} at {price}")
         return {"status": "live_placeholder"}
 
-# ---------------------------- MULTI-ASSET TRADER ----------------------------
+# ---------------------------- MULTI-ASSET TRADER (fixed) ----------------------------
 class MultiTrader:
     def __init__(self, symbols, initial_balance, risk_mgr, db, telegram_token, chat_id, live_broker):
         self.db = db
@@ -1305,7 +1298,7 @@ def test_telegram():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# ---------------------------- TELEGRAM BOT (Fixed Conflict handling) ----------------------------
+# ---------------------------- TELEGRAM BOT (FIXED: asyncio.run) ----------------------------
 def get_main_keyboard():
     buttons = [
         [KeyboardButton("📊 Status"), KeyboardButton("🔍 Scan")],
@@ -1672,48 +1665,57 @@ def keep_alive():
             logger.error(f"Keep-alive ping failed: {e}")
         time.sleep(240)
 
-# ---------------------------- TELEGRAM RUNNER (Fixed Conflict) ----------------------------
+# ---------------------------- TELEGRAM RUNNER (FIXED: asyncio.run) ----------------------------
 def run_telegram():
     if not Config.TELEGRAM_TOKEN:
         logger.warning("No Telegram token, skipping bot.")
         return
 
+    async def start_bot():
+        """Create and start the Telegram bot with proper event loop handling."""
+        app_tg = Application.builder().token(Config.TELEGRAM_TOKEN).build()
+        app_tg.add_handler(CommandHandler("start", start))
+        app_tg.add_handler(CommandHandler("help", help_cmd))
+        app_tg.add_handler(CommandHandler("ping", ping_cmd))
+        app_tg.add_handler(CommandHandler("loopstatus", loopstatus_cmd))
+        app_tg.add_handler(CommandHandler("status", status_cmd))
+        app_tg.add_handler(CommandHandler("performance", performance))
+        app_tg.add_handler(CommandHandler("backtest", backtest))
+        app_tg.add_handler(CommandHandler("scan", scan))
+        app_tg.add_handler(CommandHandler("pause", pause))
+        app_tg.add_handler(CommandHandler("resume", resume))
+        app_tg.add_handler(CommandHandler("restartloop", restartloop_cmd))
+        app_tg.add_handler(CommandHandler("settings", settings_cmd))
+        app_tg.add_handler(CommandHandler("set", set_cmd))
+        app_tg.add_handler(CommandHandler("reset", reset_cmd))
+        app_tg.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_button))
+
+        # Delete webhook before polling
+        try:
+            await app_tg.bot.delete_webhook()
+            logger.info("Webhook deleted.")
+        except Exception as e:
+            logger.warning(f"Webhook deletion failed: {e}")
+
+        logger.info("Telegram bot started, polling...")
+        await app_tg.initialize()
+        await app_tg.start()
+        await app_tg.updater.start_polling()
+
+        # Keep running
+        while True:
+            await asyncio.sleep(1)
+
     while True:
         try:
-            # Create a new application instance each loop to ensure clean state
-            app_tg = Application.builder().token(Config.TELEGRAM_TOKEN).build()
-            app_tg.add_handler(CommandHandler("start", start))
-            app_tg.add_handler(CommandHandler("help", help_cmd))
-            app_tg.add_handler(CommandHandler("ping", ping_cmd))
-            app_tg.add_handler(CommandHandler("loopstatus", loopstatus_cmd))
-            app_tg.add_handler(CommandHandler("status", status_cmd))
-            app_tg.add_handler(CommandHandler("performance", performance))
-            app_tg.add_handler(CommandHandler("backtest", backtest))
-            app_tg.add_handler(CommandHandler("scan", scan))
-            app_tg.add_handler(CommandHandler("pause", pause))
-            app_tg.add_handler(CommandHandler("resume", resume))
-            app_tg.add_handler(CommandHandler("restartloop", restartloop_cmd))
-            app_tg.add_handler(CommandHandler("settings", settings_cmd))
-            app_tg.add_handler(CommandHandler("set", set_cmd))
-            app_tg.add_handler(CommandHandler("reset", reset_cmd))
-            app_tg.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_button))
-
-            # Before starting polling, delete webhook to avoid conflicts
-            logger.info("Deleting webhook...")
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            loop.run_until_complete(app_tg.bot.delete_webhook())
-            loop.close()
-
-            logger.info("Telegram bot started, polling...")
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            app_tg.run_polling()
-            break  # if polling ends normally (should not happen)
+            asyncio.run(start_bot())
         except Conflict as e:
             logger.warning(f"Conflict detected (another instance running): {e}. Retrying in 15 seconds...")
             time.sleep(15)
             continue
+        except KeyboardInterrupt:
+            logger.info("Telegram bot stopped by user.")
+            break
         except Exception as e:
             logger.error(f"Telegram polling crashed: {e}. Restarting in 10 seconds...")
             time.sleep(10)
