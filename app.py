@@ -1,9 +1,6 @@
 #!/usr/bin/env python3
 """
-Multi-Asset Consensus Trading Bot – Diagnostic Final
-- Every scan step is logged (Scanning BTC-USDT...)
-- /loopstatus command to check trading loop health
-- Enhanced error handling and logging
+Multi-Asset Consensus Trading Bot – Final Production (Multi-TF Debug)
 """
 
 import os
@@ -46,11 +43,12 @@ class Config:
     TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
     DB_FILE = os.getenv("DB_FILE", "trades.db")
     CSV_FILE = os.getenv("CSV_FILE", "trades.csv")
-    LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")  # ensure INFO or DEBUG
+    LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
     OPTIMIZE_ON_START = os.getenv("OPTIMIZE_ON_START", "true").lower() == "true"
     OPTIMIZE_TRAIN_DAYS = int(os.getenv("OPTIMIZE_TRAIN_DAYS", "60"))
     OPTIMIZE_TEST_DAYS = int(os.getenv("OPTIMIZE_TEST_DAYS", "30"))
     BACKTEST_MONTHS = int(os.getenv("BACKTEST_MONTHS", "12"))
+    MULTI_TF_REQUIRED = int(os.getenv("MULTI_TF_REQUIRED", "2"))  # how many timeframes must agree
 
     EXCHANGE_NAME = os.getenv("EXCHANGE_NAME", "")
     EXCHANGE_API_KEY = os.getenv("EXCHANGE_API_KEY", "")
@@ -726,7 +724,7 @@ class LiveBroker:
         logger.info(f"[LIVE] {side} {size} {symbol} at {price}")
         return {"status": "live_placeholder"}
 
-# ---------------------------- MULTI-ASSET TRADER (with diagnostic logging) ----------------------------
+# ---------------------------- MULTI-ASSET TRADER (with multi-TF logging and fix) ----------------------------
 class MultiTrader:
     def __init__(self, symbols, initial_balance, risk_mgr, db, telegram_token, chat_id, live_broker):
         self.db = db
@@ -995,7 +993,7 @@ class MultiTrader:
                 base_weights[k] /= total
         return base_weights
 
-    # ------------------------ MULTI-TIMEFRAME CONSENSUS (with signal logging) ------------------------
+    # ------------------------ MULTI-TIMEFRAME CONSENSUS (with detailed logging) ------------------------
     def get_multi_tf_signal(self, symbol, price, atr, trend_ok):
         timeframes = ['15min', '1hour', '4hour']
         tf_directions = []
@@ -1006,6 +1004,8 @@ class MultiTrader:
         if symbol in self.optimal_thresholds:
             threshold = self.optimal_thresholds[symbol]
 
+        logger.info(f"Multi-TF consensus for {symbol}: threshold={threshold}, min_sources={Config.MIN_SOURCES}")
+
         for tf in timeframes:
             signals = []
             for src in self.sources[symbol]:
@@ -1014,21 +1014,29 @@ class MultiTrader:
                     signals.append(sig)
                     self.db.log_signal(int(time.time()), symbol, sig.source, sig.direction, sig.confidence)
             if signals:
-                logger.info(f"{symbol} {tf} signals: {len(signals)} active: {[f'{s.source}:{s.direction}' for s in signals]}")
+                logger.info(f"{symbol} {tf} signals: {len(signals)} active: {[f'{s.source}:{s.direction} ({s.confidence:.2f})' for s in signals]}")
                 engine = ConsensusEngine(threshold=threshold, weights=weights, min_sources=Config.MIN_SOURCES)
                 direction, conf, details = engine.aggregate(signals)
+                logger.info(f"{symbol} {tf} consensus -> direction={direction}, conf={conf:.2f}, threshold={threshold}")
                 if direction != 0 and conf >= threshold:
                     tf_directions.append(direction)
                     tf_details.append(f"{tf}:{direction}")
+                    logger.info(f"{symbol} {tf} added to consensus: direction={direction}")
+                else:
+                    logger.info(f"{symbol} {tf} rejected (direction={direction}, conf={conf:.2f} < {threshold})")
             else:
                 logger.debug(f"{symbol} {tf} no signals")
-        if len(tf_directions) >= 2:
+
+        if len(tf_directions) >= Config.MULTI_TF_REQUIRED:
             buy_votes = sum(1 for d in tf_directions if d == 1)
             sell_votes = sum(1 for d in tf_directions if d == -1)
+            logger.info(f"{symbol} Multi-TF votes: buys={buy_votes}, sells={sell_votes}, required={Config.MULTI_TF_REQUIRED}")
             if buy_votes > sell_votes:
                 return 1, tf_details
             elif sell_votes > buy_votes:
                 return -1, tf_details
+        else:
+            logger.info(f"{symbol} Multi-TF consensus failed: only {len(tf_directions)}/{Config.MULTI_TF_REQUIRED} timeframes agreed")
         return 0, tf_details
 
     # ------------------------ SEND ALERT ------------------------
@@ -1122,7 +1130,7 @@ class MultiTrader:
         )
         self.send_alert(msg)
 
-    # ------------------------ STEP (main loop with scanning log) ------------------------
+    # ------------------------ STEP (main loop) ------------------------
     def step(self):
         for symbol in self.symbols:
             logger.info(f"Scanning {symbol}...")
@@ -1155,7 +1163,7 @@ class MultiTrader:
             if self.risk_mgr.open_positions.get(symbol, []):
                 continue
 
-            # Get consensus
+            # Get multi-timeframe consensus
             direction, tf_details = self.get_multi_tf_signal(symbol, price, atr, trend_ok)
             if direction != 0:
                 logger.info(f"Consensus for {symbol}: direction={direction}, details={tf_details}")
@@ -1220,7 +1228,7 @@ trader_global = None
 
 @app.route('/')
 def health():
-    return jsonify({"status": "running", "version": "diagnostic", "time": datetime.now().isoformat()})
+    return jsonify({"status": "running", "version": "final", "time": datetime.now().isoformat()})
 
 @app.route('/download')
 def download_csv():
@@ -1274,7 +1282,6 @@ async def ping_cmd(update: Update, context):
         logger.error(f"Error in ping_cmd: {e}")
 
 async def loopstatus_cmd(update: Update, context):
-    """Check if the trading loop is alive."""
     if trader_global is None:
         await update.message.reply_text("Trader not initialized.", reply_markup=get_main_keyboard())
         return
@@ -1290,7 +1297,7 @@ async def start(update: Update, context):
         await update.message.reply_text("⏳ Processing...", reply_markup=get_main_keyboard())
         logger.info(f"Received /start from {update.effective_user.id}")
         await update.message.reply_text(
-            "🤖 <b>Consensus Trader (Diagnostic)</b>\n\n"
+            "🤖 <b>Consensus Trader (Final)</b>\n\n"
             "Commands:\n"
             "/status – Account\n/scan – Force scan\n/performance – Stats\n"
             "/backtest <symbol> – Run 12-month backtest\n"
@@ -1507,7 +1514,6 @@ async def restartloop_cmd(update: Update, context):
         trader_global.running = False
         time.sleep(1)
         trader_global.running = True
-        # Start a new loop thread
         trader_global.loop_thread = threading.Thread(target=trader_global._run_loop_wrapper, daemon=True)
         trader_global.loop_thread.start()
         await update.message.reply_text("✅ Trading loop restarted.", reply_markup=get_main_keyboard())
@@ -1658,21 +1664,6 @@ def keep_alive():
             logger.error(f"Keep-alive ping failed: {e}")
         time.sleep(240)
 
-# ---------------------------- TRADING LOOP WRAPPER (Auto-Restart) ----------------------------
-def start_trading_loop_with_restart(trader):
-    while True:
-        try:
-            if trader is None:
-                logger.error("Trader is None, cannot start loop.")
-                time.sleep(30)
-                continue
-            trader.running = True
-            trader.run_loop()
-        except Exception as e:
-            logger.error(f"Trading loop crashed: {e}. Restarting in 10 seconds...", exc_info=True)
-            time.sleep(10)
-            continue
-
 # ---------------------------- TELEGRAM RUNNER (Fixed Event Loop & Conflict) ----------------------------
 def run_telegram():
     if not Config.TELEGRAM_TOKEN:
@@ -1753,9 +1744,6 @@ if __name__ == "__main__":
 
     threading.Thread(target=keep_alive, daemon=True).start()
     logger.info("Keep-alive thread started.")
-
-    # Start the trading loop thread (already started inside MultiTrader, but we keep the old method for fallback)
-    # The MultiTrader constructor already started a thread, so we don't need to start another.
 
     logger.info("Starting Telegram bot on main thread...")
     run_telegram()
