@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Multi-Asset Consensus Trading Bot – Production with Full Error Logging
+Multi-Asset Consensus Trading Bot – Production with Status Timeout Fallback
 """
 
 import os
@@ -1071,17 +1071,60 @@ async def help_cmd(update: Update, context):
 
 async def status_cmd(update: Update, context):
     try:
+        # Send immediate "⏳" reply
         await update.message.reply_text("⏳ Fetching status...", reply_markup=get_main_keyboard())
         logger.info(f"Received /status from {update.effective_user.id}")
+
         if trader_global is None:
             await update.message.reply_text("Trader not ready.", reply_markup=get_main_keyboard())
             return
-        t = trader_global
-        drawdown = t.risk_mgr.get_drawdown_pct() * 100
+
+        # We'll try to compute status with a timeout
+        # Use a thread to compute status and set a timeout
+        result_container = {}
+        def compute_status():
+            try:
+                t = trader_global
+                drawdown = t.risk_mgr.get_drawdown_pct() * 100
+                daily_pnl = t.db.get_daily_pnl()
+                total_pos = t.risk_mgr.get_total_positions()
+                balance = t.balance
+                running = t.running
+                result_container['success'] = True
+                result_container['drawdown'] = drawdown
+                result_container['daily_pnl'] = daily_pnl
+                result_container['total_pos'] = total_pos
+                result_container['balance'] = balance
+                result_container['running'] = running
+            except Exception as e:
+                result_container['error'] = str(e)
+
+        thread = threading.Thread(target=compute_status)
+        thread.daemon = True
+        thread.start()
+        thread.join(timeout=5.0)  # wait max 5 seconds
+
+        if 'error' in result_container:
+            logger.error(f"Status computation error: {result_container['error']}")
+            await update.message.reply_text("⚠️ Error computing status. Try again.", reply_markup=get_main_keyboard())
+            return
+
+        if not result_container.get('success'):
+            # Timeout or failure
+            logger.warning("Status computation timed out or failed.")
+            await update.message.reply_text("⚠️ Status temporarily unavailable. Please try again later.", reply_markup=get_main_keyboard())
+            return
+
+        # Build message
+        drawdown = result_container['drawdown']
+        daily_pnl = result_container['daily_pnl']
+        total_pos = result_container['total_pos']
+        balance = result_container['balance']
+        running = result_container['running']
         msg = (
-            f"📊 <b>Status</b>\nBalance: ${t.balance:.2f}\nDaily PnL: ${t.db.get_daily_pnl():.2f}\n"
-            f"Open Positions: {t.risk_mgr.get_total_positions()}\n"
-            f"Drawdown: {drawdown:.2f}%\nRunning: {'✅' if t.running else '⏸️'}"
+            f"📊 <b>Status</b>\nBalance: ${balance:.2f}\nDaily PnL: ${daily_pnl:.2f}\n"
+            f"Open Positions: {total_pos}\n"
+            f"Drawdown: {drawdown:.2f}%\nRunning: {'✅' if running else '⏸️'}"
         )
         safe_msg = sanitize_html(msg)
         logger.info("Sending final status message...")
