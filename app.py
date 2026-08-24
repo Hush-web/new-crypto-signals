@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Multi-Asset Consensus Trading Bot – Full Settings Dashboard + Liveness Fix
+Multi-Asset Consensus Trading Bot – Final Production Version
+Includes /test endpoint, startup message, and forced webhook cleanup.
 """
 
 import os
@@ -169,13 +170,6 @@ class TradeDB:
             self.cursor.execute(
                 "SELECT COALESCE(SUM(pnl), 0) FROM trades WHERE timestamp >= ?",
                 (today_start,)
-            )
-            return self.cursor.fetchone()[0]
-
-    def get_total_pnl(self):
-        with self.lock:
-            self.cursor.execute(
-                "SELECT COALESCE(SUM(pnl), 0) FROM trades WHERE side IN ('buy','sell')"
             )
             return self.cursor.fetchone()[0]
 
@@ -993,7 +987,7 @@ trader_global = None
 
 @app.route('/')
 def health():
-    return jsonify({"status": "running", "version": "liveness-fix", "time": datetime.now().isoformat()})
+    return jsonify({"status": "running", "version": "final-production", "time": datetime.now().isoformat()})
 
 @app.route('/download')
 def download_csv():
@@ -1013,6 +1007,17 @@ def status():
         "drawdown": trader_global.risk_mgr.get_drawdown_pct() * 100
     })
 
+# ---------- TEST ENDPOINT ----------
+@app.route('/test')
+def test_telegram():
+    if trader_global is None:
+        return jsonify({"error": "trader not initialized"}), 500
+    try:
+        trader_global.send_alert("🧪 Test message from bot!")
+        return jsonify({"status": "sent"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 # ---------------------------- TELEGRAM BOT ----------------------------
 def get_main_keyboard():
     buttons = [
@@ -1022,11 +1027,9 @@ def get_main_keyboard():
     ]
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True, one_time_keyboard=False)
 
-# ---------- Liveness Check ----------
 async def ping_cmd(update: Update, context):
     await update.message.reply_text("🏓 Pong! Bot is alive.", reply_markup=get_main_keyboard())
 
-# ---------- Immediate-reply wrappers ----------
 async def start(update: Update, context):
     await update.message.reply_text("⏳ Processing...", reply_markup=get_main_keyboard())
     logger.info(f"Received /start from {update.effective_user.id}")
@@ -1308,9 +1311,8 @@ async def handle_button(update: Update, context):
     elif text == "❓ Help":
         await help_cmd(update, context)
 
-# ---------------------------- KEEP-ALIVE FUNCTION ----------------------------
+# ---------------------------- KEEP-ALIVE ----------------------------
 def keep_alive():
-    """Ping the local Flask server every 4 minutes to prevent Render from sleeping."""
     port = os.getenv('PORT', 5000)
     url = f"http://localhost:{port}/"
     while True:
@@ -1321,7 +1323,7 @@ def keep_alive():
             logger.error(f"Keep-alive ping failed: {e}")
         time.sleep(240)
 
-# ---------------------------- TELEGRAM RUNNER (Main Thread) ----------------------------
+# ---------------------------- TELEGRAM RUNNER ----------------------------
 def run_telegram():
     if not Config.TELEGRAM_TOKEN:
         logger.warning("No Telegram token, skipping bot.")
@@ -1376,17 +1378,20 @@ if __name__ == "__main__":
     )
     trader_global = trader
 
-    # Start trading loop in background daemon thread
-    threading.Thread(target=trader.run_loop, daemon=True).start()
+    # Send startup message
+    if trader.telegram_token and trader.chat_id:
+        try:
+            trader.send_alert("🤖 Bot is starting up and online!")
+        except Exception as e:
+            logger.error(f"Startup message failed: {e}")
 
-    # Start Flask server in background daemon thread
+    # Start threads
+    threading.Thread(target=trader.run_loop, daemon=True).start()
     threading.Thread(
         target=app.run,
         kwargs={'host': '0.0.0.0', 'port': int(os.getenv('PORT', 5000))},
         daemon=True
     ).start()
-
-    # Start keep-alive thread (internal pinger)
     threading.Thread(target=keep_alive, daemon=True).start()
     logger.info("Keep-alive thread started.")
 
