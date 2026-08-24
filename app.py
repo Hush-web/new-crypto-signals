@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-Multi-Asset Consensus Trading Bot – Final Production (Multi-TF Debug)
+Multi-Asset Consensus Trading Bot – FINAL FIXED (PID + Conflict)
 """
 
 import os
+import sys
 import time
 import csv
 import sqlite3
@@ -13,15 +14,95 @@ import asyncio
 import requests
 import re
 import numpy as np
-from datetime import datetime, timedelta
+import atexit
+import subprocess
+from datetime import datetime
 from typing import Optional, List, Tuple, Set, Dict, Any
 from dotenv import load_dotenv
 from flask import Flask, jsonify, send_file
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import Application, CommandHandler, MessageHandler, filters
 from telegram.error import Conflict
 
 load_dotenv()
+
+# ---------------------------- PID FILE (Robust) ----------------------------
+PID_FILE = "bot.pid"
+
+def write_pid():
+    with open(PID_FILE, 'w') as f:
+        f.write(str(os.getpid()))
+    print(f"[INFO] PID {os.getpid()} written to {PID_FILE}")
+
+def remove_pid():
+    if os.path.exists(PID_FILE):
+        os.remove(PID_FILE)
+        print(f"[INFO] Removed PID file {PID_FILE}")
+
+def is_process_running(pid: int) -> bool:
+    """Check if a process with given PID is running (cross-platform)."""
+    try:
+        # Try using psutil (more reliable)
+        import psutil
+        if psutil.pid_exists(pid):
+            proc = psutil.Process(pid)
+            # Check if it's a Python process (optional)
+            if 'python' in proc.name().lower() or 'python' in ' '.join(proc.cmdline()).lower():
+                return True
+            return False
+        return False
+    except ImportError:
+        # Fallback to tasklist on Windows, ps on Unix
+        if sys.platform == 'win32':
+            try:
+                output = subprocess.check_output(f'tasklist /FI "PID eq {pid}"', shell=True, text=True)
+                # tasklist output includes the process name; check for Python
+                if str(pid) in output:
+                    # Check if it's a Python process
+                    if 'python' in output.lower():
+                        return True
+                return False
+            except Exception:
+                return False
+        else:
+            try:
+                os.kill(pid, 0)
+                # Also check if it's a Python process (optional)
+                # Could read /proc but skip for simplicity
+                return True
+            except OSError:
+                return False
+
+def check_and_clean_pid():
+    if not os.path.exists(PID_FILE):
+        return True  # no PID file, safe to start
+    try:
+        with open(PID_FILE, 'r') as f:
+            pid_str = f.read().strip()
+            if not pid_str:
+                os.remove(PID_FILE)
+                return True
+            pid = int(pid_str)
+        if is_process_running(pid):
+            print(f"[ERROR] Another instance is running with PID {pid}. Exiting.")
+            return False
+        else:
+            print(f"[WARN] Stale PID file found (PID {pid} not running). Removing it.")
+            os.remove(PID_FILE)
+            return True
+    except Exception as e:
+        print(f"[WARN] Could not read PID file: {e}. Removing it.")
+        try:
+            os.remove(PID_FILE)
+        except:
+            pass
+        return True
+
+if not check_and_clean_pid():
+    sys.exit(1)
+
+write_pid()
+atexit.register(remove_pid)
 
 # ---------------------------- CONFIGURATION ----------------------------
 class Config:
@@ -48,7 +129,7 @@ class Config:
     OPTIMIZE_TRAIN_DAYS = int(os.getenv("OPTIMIZE_TRAIN_DAYS", "60"))
     OPTIMIZE_TEST_DAYS = int(os.getenv("OPTIMIZE_TEST_DAYS", "30"))
     BACKTEST_MONTHS = int(os.getenv("BACKTEST_MONTHS", "12"))
-    MULTI_TF_REQUIRED = int(os.getenv("MULTI_TF_REQUIRED", "2"))  # how many timeframes must agree
+    MULTI_TF_REQUIRED = int(os.getenv("MULTI_TF_REQUIRED", "2"))
 
     EXCHANGE_NAME = os.getenv("EXCHANGE_NAME", "")
     EXCHANGE_API_KEY = os.getenv("EXCHANGE_API_KEY", "")
@@ -97,7 +178,7 @@ def get_kucoin_symbols() -> Set[str]:
         logger.error(f"Failed to fetch KuCoin symbols: {e}")
     return set()
 
-# ---------------------------- DATABASE ----------------------------
+# ---------------------------- DATABASE (unchanged) ----------------------------
 class TradeDB:
     def __init__(self, db_file=Config.DB_FILE):
         self.conn = sqlite3.connect(db_file, check_same_thread=False)
@@ -179,7 +260,7 @@ class TradeDB:
     def close(self):
         self.conn.close()
 
-# ---------------------------- SETTINGS MANAGER ----------------------------
+# ---------------------------- SETTINGS MANAGER (unchanged) ----------------------------
 class SettingsManager:
     def __init__(self, db: TradeDB):
         self.db = db
@@ -266,7 +347,7 @@ class SettingsManager:
             self.db.cursor.execute("DELETE FROM user_settings WHERE chat_id = ?", (chat_id,))
             self.db.conn.commit()
 
-# ---------------------------- CSV PERFORMANCE LOGGER ----------------------------
+# ---------------------------- CSV PERFORMANCE LOGGER (unchanged) ----------------------------
 class PerformanceLogger:
     def __init__(self, csv_file=Config.CSV_FILE):
         self.csv_file = csv_file
@@ -348,7 +429,7 @@ class PerformanceLogger:
             logger.error(f"CSV read error: {e}")
             return None
 
-# ---------------------------- MARKET DATA (KuCoin) ----------------------------
+# ---------------------------- MARKET DATA (unchanged) ----------------------------
 class MarketData:
     def __init__(self, symbol):
         self.symbol = symbol
@@ -469,7 +550,7 @@ class MarketData:
             'low': float(data.get('low', 0)),
         }
 
-# ---------------------------- SIGNAL SOURCES ----------------------------
+# ---------------------------- SIGNAL SOURCES (unchanged) ----------------------------
 class Signal:
     def __init__(self, direction, confidence, source, timestamp=None):
         self.direction = direction
@@ -596,7 +677,7 @@ class ConsensusEngine:
         details = [f"{sig.source}:{sig.direction} ({sig.confidence:.2f})" for sig in active]
         return direction, avg_conf, details
 
-# ---------------------------- RISK MANAGER ----------------------------
+# ---------------------------- RISK MANAGER (unchanged) ----------------------------
 class RiskManager:
     def __init__(self, initial_balance, config):
         self.initial_balance = initial_balance
@@ -724,7 +805,7 @@ class LiveBroker:
         logger.info(f"[LIVE] {side} {size} {symbol} at {price}")
         return {"status": "live_placeholder"}
 
-# ---------------------------- MULTI-ASSET TRADER (with multi-TF logging and fix) ----------------------------
+# ---------------------------- MULTI-ASSET TRADER ----------------------------
 class MultiTrader:
     def __init__(self, symbols, initial_balance, risk_mgr, db, telegram_token, chat_id, live_broker):
         self.db = db
@@ -745,7 +826,6 @@ class MultiTrader:
         self.performance_logger = PerformanceLogger(Config.CSV_FILE)
         self.last_prices = {}
         self.heartbeat_counter = 0
-
         self.optimal_thresholds = {}
 
         if Config.OPTIMIZE_ON_START:
@@ -754,7 +834,6 @@ class MultiTrader:
         else:
             logger.info("Optimization disabled (OPTIMIZE_ON_START=false)")
 
-        # Start the trading loop immediately in a separate thread
         logger.info("Starting trading loop thread...")
         self.loop_thread = threading.Thread(target=self._run_loop_wrapper, daemon=True)
         self.loop_thread.start()
@@ -791,7 +870,6 @@ class MultiTrader:
             self._init_market_data()
             logger.info("Settings reloaded and market data updated")
 
-    # ------------------------ WALK-FORWARD OPTIMIZATION (background) ------------------------
     def run_optimization(self):
         for sym in self.symbols:
             try:
@@ -823,11 +901,11 @@ class MultiTrader:
         best_th = 0.4
         best_score = -999
         for th in thresholds:
-            train_result = self._run_backtest_on_data(symbol, train_data, threshold=th, months=0)
-            if train_result is None or isinstance(train_result, str):
+            train_result = self._run_backtest_on_data(symbol, train_data, threshold=th)
+            if train_result is None:
                 continue
-            test_result = self._run_backtest_on_data(symbol, test_data, threshold=th, months=0)
-            if test_result is None or isinstance(test_result, str):
+            test_result = self._run_backtest_on_data(symbol, test_data, threshold=th)
+            if test_result is None:
                 continue
             score = test_result.get('profit_factor', 0) * test_result.get('win_rate', 0) / 100
             if score > best_score:
@@ -835,7 +913,7 @@ class MultiTrader:
                 best_th = th
         return best_th
 
-    def _run_backtest_on_data(self, symbol, ohlcv, threshold, months=0):
+    def _run_backtest_on_data(self, symbol, ohlcv, threshold):
         if len(ohlcv) < 50:
             return None
         balance = Config.INITIAL_BALANCE
@@ -969,7 +1047,6 @@ class MultiTrader:
             'final_balance': balance
         }
 
-    # ------------------------ DYNAMIC WEIGHTS ------------------------
     def get_dynamic_weights(self, symbol, price, atr):
         settings = self.override_settings or {}
         base_weights = {
@@ -993,7 +1070,6 @@ class MultiTrader:
                 base_weights[k] /= total
         return base_weights
 
-    # ------------------------ MULTI-TIMEFRAME CONSENSUS (with detailed logging) ------------------------
     def get_multi_tf_signal(self, symbol, price, atr, trend_ok):
         timeframes = ['15min', '1hour', '4hour']
         tf_directions = []
@@ -1004,8 +1080,6 @@ class MultiTrader:
         if symbol in self.optimal_thresholds:
             threshold = self.optimal_thresholds[symbol]
 
-        logger.info(f"Multi-TF consensus for {symbol}: threshold={threshold}, min_sources={Config.MIN_SOURCES}")
-
         for tf in timeframes:
             signals = []
             for src in self.sources[symbol]:
@@ -1014,32 +1088,21 @@ class MultiTrader:
                     signals.append(sig)
                     self.db.log_signal(int(time.time()), symbol, sig.source, sig.direction, sig.confidence)
             if signals:
-                logger.info(f"{symbol} {tf} signals: {len(signals)} active: {[f'{s.source}:{s.direction} ({s.confidence:.2f})' for s in signals]}")
                 engine = ConsensusEngine(threshold=threshold, weights=weights, min_sources=Config.MIN_SOURCES)
                 direction, conf, details = engine.aggregate(signals)
-                logger.info(f"{symbol} {tf} consensus -> direction={direction}, conf={conf:.2f}, threshold={threshold}")
                 if direction != 0 and conf >= threshold:
                     tf_directions.append(direction)
                     tf_details.append(f"{tf}:{direction}")
-                    logger.info(f"{symbol} {tf} added to consensus: direction={direction}")
-                else:
-                    logger.info(f"{symbol} {tf} rejected (direction={direction}, conf={conf:.2f} < {threshold})")
-            else:
-                logger.debug(f"{symbol} {tf} no signals")
 
         if len(tf_directions) >= Config.MULTI_TF_REQUIRED:
             buy_votes = sum(1 for d in tf_directions if d == 1)
             sell_votes = sum(1 for d in tf_directions if d == -1)
-            logger.info(f"{symbol} Multi-TF votes: buys={buy_votes}, sells={sell_votes}, required={Config.MULTI_TF_REQUIRED}")
             if buy_votes > sell_votes:
                 return 1, tf_details
             elif sell_votes > buy_votes:
                 return -1, tf_details
-        else:
-            logger.info(f"{symbol} Multi-TF consensus failed: only {len(tf_directions)}/{Config.MULTI_TF_REQUIRED} timeframes agreed")
         return 0, tf_details
 
-    # ------------------------ SEND ALERT ------------------------
     def send_alert(self, message):
         if not self.telegram_token or not self.chat_id:
             return
@@ -1052,16 +1115,7 @@ class MultiTrader:
             )
         except Exception as e:
             logger.error(f"Telegram send error: {e}")
-            try:
-                requests.post(
-                    f"https://api.telegram.org/bot{self.telegram_token}/sendMessage",
-                    json={"chat_id": self.chat_id, "text": message[:500] + "..." if len(message)>500 else message},
-                    timeout=30
-                )
-            except:
-                pass
 
-    # ------------------------ PRICE AND ATR ------------------------
     def get_price_and_atr(self, symbol, timeframe='1hour'):
         ohlcv = self.markets[symbol].get_ohlcv(limit=100, timeframe=timeframe)
         if ohlcv is None or len(ohlcv) < 50:
@@ -1086,9 +1140,7 @@ class MultiTrader:
             trend_ok = True
         return price, atr, trend_ok, trend_ma
 
-    # ------------------------ EXECUTE SIGNAL ------------------------
     def execute_signal(self, symbol, direction, price, atr, tf_details, trend_ok):
-        logger.info(f"execute_signal called for {symbol}, direction={direction}, price={price:.2f}")
         settings = self.override_settings or {}
         can_trade, reason = self.risk_mgr.can_trade(symbol, price, atr, trend_ok, settings)
         if not can_trade:
@@ -1097,7 +1149,6 @@ class MultiTrader:
 
         size = self.risk_mgr.compute_position_size(self.balance, price, atr, settings)
         if size <= 0:
-            logger.info(f"Position size zero for {symbol}")
             return
         risk = atr * 2.5
         stop_loss = price - risk if direction == 1 else price + risk
@@ -1111,11 +1162,9 @@ class MultiTrader:
                     self.send_alert(f"⚠️ Insufficient balance for {symbol}")
                     return
                 self.balance -= cost
-            # For paper shorts: no balance change on entry
 
         self.risk_mgr.open_position(symbol, side, price, size, stop_loss, take_profit)
         self.db.log_trade(int(time.time()), symbol, side, price, size, 0.0, 0.0, self.balance)
-        logger.info(f"Trade opened for {symbol}: {side} {size:.4f} @ {price:.2f}")
 
         details_html = "<br>".join([sanitize_html(f"• {d}") for d in tf_details])
         msg = (
@@ -1130,17 +1179,13 @@ class MultiTrader:
         )
         self.send_alert(msg)
 
-    # ------------------------ STEP (main loop) ------------------------
     def step(self):
         for symbol in self.symbols:
-            logger.info(f"Scanning {symbol}...")
             result = self.get_price_and_atr(symbol, timeframe='1hour')
             if result is None or result[0] is None:
-                logger.warning(f"Could not get price/ATR for {symbol}, skipping")
                 continue
             price, atr, trend_ok, trend_ma = result
 
-            # Check existing positions
             pnl, status, pos = self.risk_mgr.check_sl_tp(symbol, price)
             if pnl != 0 and pos is not None:
                 with self.balance_lock:
@@ -1163,16 +1208,11 @@ class MultiTrader:
             if self.risk_mgr.open_positions.get(symbol, []):
                 continue
 
-            # Get multi-timeframe consensus
             direction, tf_details = self.get_multi_tf_signal(symbol, price, atr, trend_ok)
             if direction != 0:
-                logger.info(f"Consensus for {symbol}: direction={direction}, details={tf_details}")
                 self.execute_signal(symbol, direction, price, atr, tf_details, trend_ok)
-            else:
-                logger.debug(f"No consensus for {symbol}")
 
     def _run_loop_wrapper(self):
-        """Wrapper that runs the trading loop with auto-restart."""
         while True:
             try:
                 self.running = True
@@ -1195,7 +1235,6 @@ class MultiTrader:
                 logger.error(f"Loop error: {e}", exc_info=True)
                 time.sleep(Config.TRADE_INTERVAL_SECONDS)
 
-    # ---------------------------- BACKTEST ----------------------------
     def backtest(self, symbol, lookback_days=30, timeframe='1hour'):
         if lookback_days > 60:
             months = lookback_days // 30
@@ -1207,7 +1246,7 @@ class MultiTrader:
             if ohlcv is None or len(ohlcv) < 50:
                 return "Insufficient data for backtest."
         threshold = (self.override_settings or {}).get('consensus_threshold', Config.CONSENSUS_THRESHOLD)
-        result = self._run_backtest_on_data(symbol, ohlcv, threshold=threshold, months=0)
+        result = self._run_backtest_on_data(symbol, ohlcv, threshold=threshold)
         if result is None:
             return "No trades generated in backtest period."
         return {
@@ -1266,7 +1305,7 @@ def test_telegram():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# ---------------------------- TELEGRAM BOT ----------------------------
+# ---------------------------- TELEGRAM BOT (Fixed Conflict handling) ----------------------------
 def get_main_keyboard():
     buttons = [
         [KeyboardButton("📊 Status"), KeyboardButton("🔍 Scan")],
@@ -1276,10 +1315,7 @@ def get_main_keyboard():
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True, one_time_keyboard=False)
 
 async def ping_cmd(update: Update, context):
-    try:
-        await update.message.reply_text("🏓 Pong! Bot is alive.", reply_markup=get_main_keyboard())
-    except Exception as e:
-        logger.error(f"Error in ping_cmd: {e}")
+    await update.message.reply_text("🏓 Pong! Bot is alive.", reply_markup=get_main_keyboard())
 
 async def loopstatus_cmd(update: Update, context):
     if trader_global is None:
@@ -1315,29 +1351,23 @@ async def start(update: Update, context):
         logger.error(f"Error in start: {e}")
 
 async def help_cmd(update: Update, context):
-    try:
-        await update.message.reply_text("⏳ Processing...", reply_markup=get_main_keyboard())
-        await update.message.reply_text(
-            "📋 <b>Commands</b>\n"
-            "/status – Account\n/scan – Force scan\n/performance – Stats\n"
-            "/backtest <symbol> – Run backtest\n"
-            "/settings – View/Edit settings\n"
-            "/set &lt;key&gt; &lt;value&gt; – Change a setting\n"
-            "/reset – Reset to defaults\n"
-            "/ping – Liveness check\n"
-            "/loopstatus – Check trading loop health\n"
-            "/restartloop – Restart trading loop\n"
-            "/pause – Pause\n/resume – Resume\n/help – This",
-            parse_mode='HTML', reply_markup=get_main_keyboard()
-        )
-    except Exception as e:
-        logger.error(f"Error in help: {e}")
+    await update.message.reply_text(
+        "📋 <b>Commands</b>\n"
+        "/status – Account\n/scan – Force scan\n/performance – Stats\n"
+        "/backtest <symbol> – Run backtest\n"
+        "/settings – View/Edit settings\n"
+        "/set &lt;key&gt; &lt;value&gt; – Change a setting\n"
+        "/reset – Reset to defaults\n"
+        "/ping – Liveness check\n"
+        "/loopstatus – Check trading loop health\n"
+        "/restartloop – Restart trading loop\n"
+        "/pause – Pause\n/resume – Resume\n/help – This",
+        parse_mode='HTML', reply_markup=get_main_keyboard()
+    )
 
 async def status_cmd(update: Update, context):
     try:
         await update.message.reply_text("⏳ Fetching status...", reply_markup=get_main_keyboard())
-        logger.info(f"Received /status from {update.effective_user.id}")
-
         if trader_global is None:
             await update.message.reply_text("Trader not ready.", reply_markup=get_main_keyboard())
             return
@@ -1374,7 +1404,6 @@ async def status_cmd(update: Update, context):
             return
 
         if not result_container.get('success'):
-            logger.warning("Status computation timed out or failed.")
             await update.message.reply_text("⚠️ Status temporarily unavailable. Please try again later.", reply_markup=get_main_keyboard())
             return
 
@@ -1392,16 +1421,13 @@ async def status_cmd(update: Update, context):
             f"Optimized Thresholds:\n{opt_str}"
         )
         safe_msg = sanitize_html(msg)
-        logger.info("Sending final status message...")
         await update.message.reply_text(safe_msg, parse_mode='HTML', reply_markup=get_main_keyboard())
-        logger.info("Status sent successfully.")
     except Exception as e:
         logger.error(f"Error in status_cmd: {e}", exc_info=True)
 
 async def performance(update: Update, context):
     try:
         await update.message.reply_text("⏳ Computing performance...", reply_markup=get_main_keyboard())
-        logger.info(f"Received /performance from {update.effective_user.id}")
         if trader_global is None:
             await update.message.reply_text("Trader not ready.", reply_markup=get_main_keyboard())
             return
@@ -1430,7 +1456,6 @@ async def performance(update: Update, context):
 async def backtest(update: Update, context):
     try:
         await update.message.reply_text("⏳ Running 12-month backtest...", reply_markup=get_main_keyboard())
-        logger.info(f"Received /backtest from {update.effective_user.id}")
         if trader_global is None:
             await update.message.reply_text("Trader not ready.", reply_markup=get_main_keyboard())
             return
@@ -1467,7 +1492,6 @@ async def backtest(update: Update, context):
 async def scan(update: Update, context):
     try:
         await update.message.reply_text("🔍 Scanning...", reply_markup=get_main_keyboard())
-        logger.info(f"Received /scan from {update.effective_user.id}")
         if trader_global is None:
             return
         for sym in trader_global.symbols:
@@ -1487,22 +1511,14 @@ async def scan(update: Update, context):
         logger.error(f"Error in scan: {e}", exc_info=True)
 
 async def pause(update: Update, context):
-    try:
-        await update.message.reply_text("⏳ Pausing...", reply_markup=get_main_keyboard())
-        if trader_global:
-            trader_global.running = False
-        await update.message.reply_text("⏸️ Paused.", reply_markup=get_main_keyboard())
-    except Exception as e:
-        logger.error(f"Error in pause: {e}")
+    if trader_global:
+        trader_global.running = False
+    await update.message.reply_text("⏸️ Paused.", reply_markup=get_main_keyboard())
 
 async def resume(update: Update, context):
-    try:
-        await update.message.reply_text("⏳ Resuming...", reply_markup=get_main_keyboard())
-        if trader_global:
-            trader_global.running = True
-        await update.message.reply_text("▶️ Resumed.", reply_markup=get_main_keyboard())
-    except Exception as e:
-        logger.error(f"Error in resume: {e}")
+    if trader_global:
+        trader_global.running = True
+    await update.message.reply_text("▶️ Resumed.", reply_markup=get_main_keyboard())
 
 async def restartloop_cmd(update: Update, context):
     try:
@@ -1574,7 +1590,7 @@ async def set_cmd(update: Update, context):
         chat_id = update.effective_user.id
         args = context.args
         if len(args) < 2:
-            await update.message.reply_text("Usage: /set &lt;key&gt; &lt;value&gt;\nExample: /set consensus_threshold 0.45", reply_markup=get_main_keyboard())
+            await update.message.reply_text("Usage: /set &lt;key&gt; &lt;value&gt;", reply_markup=get_main_keyboard())
             return
         key = args[0]
         value = ' '.join(args[1:])
@@ -1616,42 +1632,34 @@ async def set_cmd(update: Update, context):
         logger.error(f"Error in set_cmd: {e}", exc_info=True)
 
 async def reset_cmd(update: Update, context):
-    try:
-        await update.message.reply_text("⏳ Resetting...", reply_markup=get_main_keyboard())
-        chat_id = update.effective_user.id
-        if trader_global:
-            trader_global.settings_manager.reset(chat_id)
-            trader_global.override_settings = None
-            trader_global.reload_settings()
-            await update.message.reply_text("✅ All settings reset to defaults.", reply_markup=get_main_keyboard())
-        else:
-            await update.message.reply_text("Trader not ready.", reply_markup=get_main_keyboard())
-    except Exception as e:
-        logger.error(f"Error in reset: {e}", exc_info=True)
+    chat_id = update.effective_user.id
+    if trader_global:
+        trader_global.settings_manager.reset(chat_id)
+        trader_global.override_settings = None
+        trader_global.reload_settings()
+        await update.message.reply_text("✅ All settings reset to defaults.", reply_markup=get_main_keyboard())
+    else:
+        await update.message.reply_text("Trader not ready.", reply_markup=get_main_keyboard())
 
-# ---------- Button handler ----------
 async def handle_button(update: Update, context):
-    try:
-        text = update.message.text
-        logger.info(f"Button pressed: {text}")
-        if text == "📊 Status":
-            await status_cmd(update, context)
-        elif text == "🔍 Scan":
-            await scan(update, context)
-        elif text == "📈 Performance":
-            await performance(update, context)
-        elif text == "⏸️ Pause":
-            await pause(update, context)
-        elif text == "▶️ Resume":
-            await resume(update, context)
-        elif text == "⚙️ Settings":
-            await settings_cmd(update, context)
-        elif text == "❓ Help":
-            await help_cmd(update, context)
-    except Exception as e:
-        logger.error(f"Error in handle_button: {e}", exc_info=True)
+    text = update.message.text
+    logger.info(f"Button pressed: {text}")
+    if text == "📊 Status":
+        await status_cmd(update, context)
+    elif text == "🔍 Scan":
+        await scan(update, context)
+    elif text == "📈 Performance":
+        await performance(update, context)
+    elif text == "⏸️ Pause":
+        await pause(update, context)
+    elif text == "▶️ Resume":
+        await resume(update, context)
+    elif text == "⚙️ Settings":
+        await settings_cmd(update, context)
+    elif text == "❓ Help":
+        await help_cmd(update, context)
 
-# ---------------------------- KEEP-ALIVE (fixed) ----------------------------
+# ---------------------------- KEEP-ALIVE ----------------------------
 def keep_alive():
     port = os.getenv('PORT', 5000)
     url = f"http://localhost:{port}/"
@@ -1664,40 +1672,46 @@ def keep_alive():
             logger.error(f"Keep-alive ping failed: {e}")
         time.sleep(240)
 
-# ---------------------------- TELEGRAM RUNNER (Fixed Event Loop & Conflict) ----------------------------
+# ---------------------------- TELEGRAM RUNNER (Fixed Conflict) ----------------------------
 def run_telegram():
     if not Config.TELEGRAM_TOKEN:
         logger.warning("No Telegram token, skipping bot.")
         return
-    app_tg = Application.builder().token(Config.TELEGRAM_TOKEN).build()
-    app_tg.add_handler(CommandHandler("start", start))
-    app_tg.add_handler(CommandHandler("help", help_cmd))
-    app_tg.add_handler(CommandHandler("ping", ping_cmd))
-    app_tg.add_handler(CommandHandler("loopstatus", loopstatus_cmd))
-    app_tg.add_handler(CommandHandler("status", status_cmd))
-    app_tg.add_handler(CommandHandler("performance", performance))
-    app_tg.add_handler(CommandHandler("backtest", backtest))
-    app_tg.add_handler(CommandHandler("scan", scan))
-    app_tg.add_handler(CommandHandler("pause", pause))
-    app_tg.add_handler(CommandHandler("resume", resume))
-    app_tg.add_handler(CommandHandler("restartloop", restartloop_cmd))
-    app_tg.add_handler(CommandHandler("settings", settings_cmd))
-    app_tg.add_handler(CommandHandler("set", set_cmd))
-    app_tg.add_handler(CommandHandler("reset", reset_cmd))
-    app_tg.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_button))
 
     while True:
         try:
+            # Create a new application instance each loop to ensure clean state
+            app_tg = Application.builder().token(Config.TELEGRAM_TOKEN).build()
+            app_tg.add_handler(CommandHandler("start", start))
+            app_tg.add_handler(CommandHandler("help", help_cmd))
+            app_tg.add_handler(CommandHandler("ping", ping_cmd))
+            app_tg.add_handler(CommandHandler("loopstatus", loopstatus_cmd))
+            app_tg.add_handler(CommandHandler("status", status_cmd))
+            app_tg.add_handler(CommandHandler("performance", performance))
+            app_tg.add_handler(CommandHandler("backtest", backtest))
+            app_tg.add_handler(CommandHandler("scan", scan))
+            app_tg.add_handler(CommandHandler("pause", pause))
+            app_tg.add_handler(CommandHandler("resume", resume))
+            app_tg.add_handler(CommandHandler("restartloop", restartloop_cmd))
+            app_tg.add_handler(CommandHandler("settings", settings_cmd))
+            app_tg.add_handler(CommandHandler("set", set_cmd))
+            app_tg.add_handler(CommandHandler("reset", reset_cmd))
+            app_tg.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_button))
+
+            # Before starting polling, delete webhook to avoid conflicts
+            logger.info("Deleting webhook...")
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(app_tg.bot.delete_webhook())
+            loop.close()
+
             logger.info("Telegram bot started, polling...")
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             app_tg.run_polling()
-        except Conflict:
-            logger.warning("Conflict detected (another instance running). Stopping and retrying in 15 seconds...")
-            try:
-                app_tg.stop()
-            except:
-                pass
+            break  # if polling ends normally (should not happen)
+        except Conflict as e:
+            logger.warning(f"Conflict detected (another instance running): {e}. Retrying in 15 seconds...")
             time.sleep(15)
             continue
         except Exception as e:
