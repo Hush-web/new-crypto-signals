@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Multi-Asset Consensus Trading Bot – Production with Enhanced Logging
+Multi-Asset Consensus Trading Bot – Diagnostic Logging
 """
 
 import os
@@ -723,7 +723,7 @@ class LiveBroker:
         logger.info(f"[LIVE] {side} {size} {symbol} at {price}")
         return {"status": "live_placeholder"}
 
-# ---------------------------- MULTI-ASSET TRADER (with enhanced logging) ----------------------------
+# ---------------------------- MULTI-ASSET TRADER (with diagnostic logging) ----------------------------
 class MultiTrader:
     def __init__(self, symbols, initial_balance, risk_mgr, db, telegram_token, chat_id, live_broker):
         self.db = db
@@ -986,7 +986,7 @@ class MultiTrader:
                 base_weights[k] /= total
         return base_weights
 
-    # ------------------------ MULTI-TIMEFRAME CONSENSUS ------------------------
+    # ------------------------ MULTI-TIMEFRAME CONSENSUS (with signal logging) ------------------------
     def get_multi_tf_signal(self, symbol, price, atr, trend_ok):
         timeframes = ['15min', '1hour', '4hour']
         tf_directions = []
@@ -1005,11 +1005,14 @@ class MultiTrader:
                     signals.append(sig)
                     self.db.log_signal(int(time.time()), symbol, sig.source, sig.direction, sig.confidence)
             if signals:
+                logger.info(f"{symbol} {tf} signals: {len(signals)} active: {[f'{s.source}:{s.direction}' for s in signals]}")
                 engine = ConsensusEngine(threshold=threshold, weights=weights, min_sources=Config.MIN_SOURCES)
                 direction, conf, details = engine.aggregate(signals)
                 if direction != 0 and conf >= threshold:
                     tf_directions.append(direction)
                     tf_details.append(f"{tf}:{direction}")
+            else:
+                logger.debug(f"{symbol} {tf} no signals")
         if len(tf_directions) >= 2:
             buy_votes = sum(1 for d in tf_directions if d == 1)
             sell_votes = sum(1 for d in tf_directions if d == -1)
@@ -1066,7 +1069,7 @@ class MultiTrader:
             trend_ok = True
         return price, atr, trend_ok, trend_ma
 
-    # ------------------------ EXECUTE SIGNAL (with enhanced logging) ------------------------
+    # ------------------------ EXECUTE SIGNAL ------------------------
     def execute_signal(self, symbol, direction, price, atr, tf_details, trend_ok):
         logger.info(f"execute_signal called for {symbol}, direction={direction}, price={price:.2f}")
         settings = self.override_settings or {}
@@ -1110,9 +1113,10 @@ class MultiTrader:
         )
         self.send_alert(msg)
 
-    # ------------------------ STEP (main loop with enhanced logging) ------------------------
+    # ------------------------ STEP (main loop with scanning log) ------------------------
     def step(self):
         for symbol in self.symbols:
+            logger.info(f"Scanning {symbol}...")
             result = self.get_price_and_atr(symbol, timeframe='1hour')
             if result is None or result[0] is None:
                 logger.warning(f"Could not get price/ATR for {symbol}, skipping")
@@ -1148,8 +1152,7 @@ class MultiTrader:
                 logger.info(f"Consensus for {symbol}: direction={direction}, details={tf_details}")
                 self.execute_signal(symbol, direction, price, atr, tf_details, trend_ok)
             else:
-                # Log occasionally for debugging
-                pass
+                logger.debug(f"No consensus for {symbol}")
 
     def run_loop(self):
         logger.info("Starting multi-asset trading loop. Symbols: %s", self.symbols)
@@ -1197,7 +1200,7 @@ trader_global = None
 
 @app.route('/')
 def health():
-    return jsonify({"status": "running", "version": "final-production", "time": datetime.now().isoformat()})
+    return jsonify({"status": "running", "version": "diagnostic", "time": datetime.now().isoformat()})
 
 @app.route('/download')
 def download_csv():
@@ -1255,7 +1258,7 @@ async def start(update: Update, context):
         await update.message.reply_text("⏳ Processing...", reply_markup=get_main_keyboard())
         logger.info(f"Received /start from {update.effective_user.id}")
         await update.message.reply_text(
-            "🤖 <b>Consensus Trader (Final Production)</b>\n\n"
+            "🤖 <b>Consensus Trader (Diagnostic)</b>\n\n"
             "Commands:\n"
             "/status – Account\n/scan – Force scan\n/performance – Stats\n"
             "/backtest <symbol> – Run 12-month backtest\n"
@@ -1606,11 +1609,10 @@ async def handle_button(update: Update, context):
     except Exception as e:
         logger.error(f"Error in handle_button: {e}", exc_info=True)
 
-# ---------------------------- KEEP-ALIVE (fixed: wait for Flask to start) ----------------------------
+# ---------------------------- KEEP-ALIVE (fixed) ----------------------------
 def keep_alive():
     port = os.getenv('PORT', 5000)
     url = f"http://localhost:{port}/"
-    # Wait for Flask to be ready
     time.sleep(5)
     while True:
         try:
@@ -1700,29 +1702,24 @@ if __name__ == "__main__":
     )
     trader_global = trader
 
-    # Send startup message
     if trader.telegram_token and trader.chat_id:
         try:
             trader.send_alert("🤖 Bot is starting up and online!")
         except Exception as e:
             logger.error(f"Startup message failed: {e}")
 
-    # Start Flask server
     threading.Thread(
         target=app.run,
         kwargs={'host': '0.0.0.0', 'port': int(os.getenv('PORT', 5000))},
         daemon=True
     ).start()
 
-    # Start keep-alive thread (with initial sleep)
     threading.Thread(target=keep_alive, daemon=True).start()
     logger.info("Keep-alive thread started.")
 
-    # Start trading loop with auto-restart
     loop_thread = threading.Thread(target=start_trading_loop_with_restart, args=(trader,), daemon=True)
     loop_thread.start()
     logger.info("Trading loop thread started with auto-restart.")
 
-    # Run Telegram bot on main thread
     logger.info("Starting Telegram bot on main thread...")
     run_telegram()
