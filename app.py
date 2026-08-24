@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """
-Multi-Asset Consensus Trading Bot – FINAL FIXED (Low Threshold, Multi‑TF=1, Telegram stable)
+Multi-Asset Consensus Trading Bot – FINAL FIXED with Debug Logging
+- Added STEP and LOOP logging
+- Optimisation disabled by default
 """
 
 import os
@@ -40,7 +42,6 @@ def remove_pid():
         print(f"[INFO] Removed PID file {PID_FILE}")
 
 def is_process_running(pid: int) -> bool:
-    """Check if a process with given PID is running (cross-platform)."""
     try:
         import psutil
         if psutil.pid_exists(pid):
@@ -96,7 +97,7 @@ if not check_and_clean_pid():
 write_pid()
 atexit.register(remove_pid)
 
-# ---------------------------- CONFIGURATION (FIXED: Lower threshold, TF=1) ----------------------------
+# ---------------------------- CONFIGURATION (Optimisation off by default) ----------------------------
 class Config:
     SYMBOLS = [s.strip().replace('/', '-') for s in os.getenv("SYMBOLS", "BTC-USDT,ETH-USDT,SOL-USDT,AVAX-USDT,POL-USDT").split(',') if s.strip()]
     INITIAL_BALANCE = float(os.getenv("INITIAL_BALANCE", "10000.0"))
@@ -105,7 +106,7 @@ class Config:
     PER_TRADE_RISK_PCT = float(os.getenv("PER_TRADE_RISK_PCT", "0.02"))
     MAX_DAILY_LOSS_PCT = float(os.getenv("MAX_DAILY_LOSS_PCT", "0.05"))
     MAX_DRAWDOWN = float(os.getenv("MAX_DRAWDOWN", "0.10"))
-    CONSENSUS_THRESHOLD = float(os.getenv("CONSENSUS_THRESHOLD", "0.25"))  # lowered from 0.4
+    CONSENSUS_THRESHOLD = float(os.getenv("CONSENSUS_THRESHOLD", "0.25"))
     MIN_SOURCES = int(os.getenv("MIN_SOURCES", "1"))
     CONSECUTIVE_LOSS_LIMIT = int(os.getenv("CONSECUTIVE_LOSS_LIMIT", "3"))
     VOLATILITY_MIN = float(os.getenv("VOLATILITY_MIN", "0.005"))
@@ -117,11 +118,11 @@ class Config:
     DB_FILE = os.getenv("DB_FILE", "trades.db")
     CSV_FILE = os.getenv("CSV_FILE", "trades.csv")
     LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
-    OPTIMIZE_ON_START = os.getenv("OPTIMIZE_ON_START", "true").lower() == "true"
+    OPTIMIZE_ON_START = os.getenv("OPTIMIZE_ON_START", "false").lower() == "true"  # Disabled by default
     OPTIMIZE_TRAIN_DAYS = int(os.getenv("OPTIMIZE_TRAIN_DAYS", "60"))
     OPTIMIZE_TEST_DAYS = int(os.getenv("OPTIMIZE_TEST_DAYS", "30"))
     BACKTEST_MONTHS = int(os.getenv("BACKTEST_MONTHS", "12"))
-    MULTI_TF_REQUIRED = int(os.getenv("MULTI_TF_REQUIRED", "1"))  # changed from 2
+    MULTI_TF_REQUIRED = int(os.getenv("MULTI_TF_REQUIRED", "1"))
 
     EXCHANGE_NAME = os.getenv("EXCHANGE_NAME", "")
     EXCHANGE_API_KEY = os.getenv("EXCHANGE_API_KEY", "")
@@ -634,7 +635,7 @@ class WhaleSource(SignalSource):
             return Signal(-1, 0.60, "whale")
         return Signal(0, 0.0, "whale")
 
-# ---------------------------- CONSENSUS ENGINE (FIXED confidence) ----------------------------
+# ---------------------------- CONSENSUS ENGINE ----------------------------
 class ConsensusEngine:
     def __init__(self, threshold=Config.CONSENSUS_THRESHOLD, weights=Config.SOURCE_WEIGHTS, min_sources=Config.MIN_SOURCES):
         self.threshold = threshold
@@ -654,7 +655,6 @@ class ConsensusEngine:
         if total_w == 0:
             return 0, 0.0, []
         avg_dir = sum_dir / total_w
-        # Confidence: weighted average of confidences
         conf_num = 0.0
         conf_den = 0.0
         for sig in active:
@@ -798,7 +798,7 @@ class LiveBroker:
         logger.info(f"[LIVE] {side} {size} {symbol} at {price}")
         return {"status": "live_placeholder"}
 
-# ---------------------------- MULTI-ASSET TRADER (fixed) ----------------------------
+# ---------------------------- MULTI-ASSET TRADER (with debug logging) ----------------------------
 class MultiTrader:
     def __init__(self, symbols, initial_balance, risk_mgr, db, telegram_token, chat_id, live_broker):
         self.db = db
@@ -1134,6 +1134,7 @@ class MultiTrader:
         return price, atr, trend_ok, trend_ma
 
     def execute_signal(self, symbol, direction, price, atr, tf_details, trend_ok):
+        logger.info(f"execute_signal called for {symbol}, direction={direction}")
         settings = self.override_settings or {}
         can_trade, reason = self.risk_mgr.can_trade(symbol, price, atr, trend_ok, settings)
         if not can_trade:
@@ -1173,9 +1174,12 @@ class MultiTrader:
         self.send_alert(msg)
 
     def step(self):
+        logger.info("STEP: Entering step()")
         for symbol in self.symbols:
+            logger.info(f"STEP: Processing {symbol}")
             result = self.get_price_and_atr(symbol, timeframe='1hour')
             if result is None or result[0] is None:
+                logger.warning(f"STEP: No price data for {symbol}")
                 continue
             price, atr, trend_ok, trend_ma = result
 
@@ -1199,11 +1203,15 @@ class MultiTrader:
                 )
 
             if self.risk_mgr.open_positions.get(symbol, []):
+                logger.info(f"STEP: Symbol {symbol} has open position(s), skipping")
                 continue
 
             direction, tf_details = self.get_multi_tf_signal(symbol, price, atr, trend_ok)
             if direction != 0:
+                logger.info(f"STEP: Consensus for {symbol}: direction={direction}")
                 self.execute_signal(symbol, direction, price, atr, tf_details, trend_ok)
+            else:
+                logger.debug(f"STEP: No consensus for {symbol}")
 
     def _run_loop_wrapper(self):
         while True:
@@ -1218,6 +1226,7 @@ class MultiTrader:
     def run_loop(self):
         logger.info("Starting multi-asset trading loop. Symbols: %s", self.symbols)
         while self.running:
+            logger.info("LOOP: Iteration")
             try:
                 self.step()
                 self.heartbeat_counter += 1
@@ -1298,7 +1307,7 @@ def test_telegram():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# ---------------------------- TELEGRAM BOT (FIXED: asyncio.run) ----------------------------
+# ---------------------------- TELEGRAM BOT ----------------------------
 def get_main_keyboard():
     buttons = [
         [KeyboardButton("📊 Status"), KeyboardButton("🔍 Scan")],
@@ -1665,14 +1674,13 @@ def keep_alive():
             logger.error(f"Keep-alive ping failed: {e}")
         time.sleep(240)
 
-# ---------------------------- TELEGRAM RUNNER (FIXED: asyncio.run) ----------------------------
+# ---------------------------- TELEGRAM RUNNER (asyncio.run) ----------------------------
 def run_telegram():
     if not Config.TELEGRAM_TOKEN:
         logger.warning("No Telegram token, skipping bot.")
         return
 
     async def start_bot():
-        """Create and start the Telegram bot with proper event loop handling."""
         app_tg = Application.builder().token(Config.TELEGRAM_TOKEN).build()
         app_tg.add_handler(CommandHandler("start", start))
         app_tg.add_handler(CommandHandler("help", help_cmd))
@@ -1690,7 +1698,6 @@ def run_telegram():
         app_tg.add_handler(CommandHandler("reset", reset_cmd))
         app_tg.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_button))
 
-        # Delete webhook before polling
         try:
             await app_tg.bot.delete_webhook()
             logger.info("Webhook deleted.")
@@ -1702,7 +1709,6 @@ def run_telegram():
         await app_tg.start()
         await app_tg.updater.start_polling()
 
-        # Keep running
         while True:
             await asyncio.sleep(1)
 
@@ -1710,14 +1716,14 @@ def run_telegram():
         try:
             asyncio.run(start_bot())
         except Conflict as e:
-            logger.warning(f"Conflict detected (another instance running): {e}. Retrying in 15 seconds...")
+            logger.warning(f"Conflict detected: {e}. Retrying in 15s...")
             time.sleep(15)
             continue
         except KeyboardInterrupt:
             logger.info("Telegram bot stopped by user.")
             break
         except Exception as e:
-            logger.error(f"Telegram polling crashed: {e}. Restarting in 10 seconds...")
+            logger.error(f"Telegram polling crashed: {e}. Restarting in 10s...")
             time.sleep(10)
             continue
 
