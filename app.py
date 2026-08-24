@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """
-Multi-Asset Consensus Trading Bot – Main Thread Telegram (Signal Handler Fix)
+Multi-Asset Consensus Trading Bot – Full Settings Dashboard via Telegram
+- Dynamic configuration (consensus, risk, symbols, weights)
+- Persistent user settings in SQLite
+- All commands: /settings, /set, /reset
 """
 
 import os
@@ -14,15 +17,15 @@ import requests
 import re
 import numpy as np
 from datetime import datetime
-from typing import Optional, List, Tuple, Set
+from typing import Optional, List, Tuple, Set, Dict, Any
 from dotenv import load_dotenv
 from flask import Flask, jsonify, send_file
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters, CallbackQueryHandler
 
 load_dotenv()
 
-# ---------------------------- CONFIGURATION ----------------------------
+# ---------------------------- CONFIGURATION (from env) ----------------------------
 class Config:
     SYMBOLS = [s.strip().replace('/', '-') for s in os.getenv("SYMBOLS", "BTC-USDT,ETH-USDT,SOL-USDT,AVAX-USDT,POL-USDT").split(',') if s.strip()]
     INITIAL_BALANCE = float(os.getenv("INITIAL_BALANCE", "10000.0"))
@@ -98,6 +101,11 @@ class TradeDB:
     def __init__(self, db_file=Config.DB_FILE):
         self.conn = sqlite3.connect(db_file, check_same_thread=False)
         self.cursor = self.conn.cursor()
+        self._init_tables()
+        self.lock = threading.Lock()
+
+    def _init_tables(self):
+        # trades table
         self.cursor.execute('''
             CREATE TABLE IF NOT EXISTS trades (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -111,6 +119,7 @@ class TradeDB:
                 balance REAL
             )
         ''')
+        # signals table
         self.cursor.execute('''
             CREATE TABLE IF NOT EXISTS signals (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -121,9 +130,30 @@ class TradeDB:
                 confidence REAL
             )
         ''')
+        # user_settings table (new)
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS user_settings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER UNIQUE,
+                symbols TEXT,
+                consensus_threshold REAL,
+                min_sources INTEGER,
+                volatility_min REAL,
+                per_trade_risk_pct REAL,
+                max_daily_loss_pct REAL,
+                max_drawdown REAL,
+                max_positions_global INTEGER,
+                trend_filter INTEGER,
+                weight_ma REAL,
+                weight_rsi REAL,
+                weight_sentiment REAL,
+                weight_breakout REAL,
+                updated_at INTEGER
+            )
+        ''')
         self.conn.commit()
-        self.lock = threading.Lock()
 
+    # ---------- Existing methods ----------
     def log_trade(self, timestamp, symbol, side, price, size, fee=0.0, pnl=0.0, balance=0.0):
         with self.lock:
             self.cursor.execute(
@@ -149,8 +179,104 @@ class TradeDB:
             )
             return self.cursor.fetchone()[0]
 
+    def get_total_pnl(self):
+        with self.lock:
+            self.cursor.execute(
+                "SELECT COALESCE(SUM(pnl), 0) FROM trades WHERE side IN ('buy','sell')"
+            )
+            return self.cursor.fetchone()[0]
+
     def close(self):
         self.conn.close()
+
+# ---------------------------- SETTINGS MANAGER ----------------------------
+class SettingsManager:
+    def __init__(self, db: TradeDB):
+        self.db = db
+        self.lock = threading.Lock()
+
+    def get(self, chat_id: int) -> Optional[Dict[str, Any]]:
+        with self.lock:
+            self.db.cursor.execute(
+                "SELECT * FROM user_settings WHERE chat_id = ?", (chat_id,)
+            )
+            row = self.db.cursor.fetchone()
+            if row:
+                return {
+                    'symbols': row[2],
+                    'consensus_threshold': row[3],
+                    'min_sources': row[4],
+                    'volatility_min': row[5],
+                    'per_trade_risk_pct': row[6],
+                    'max_daily_loss_pct': row[7],
+                    'max_drawdown': row[8],
+                    'max_positions_global': row[9],
+                    'trend_filter': bool(row[10]),
+                    'weight_ma': row[11],
+                    'weight_rsi': row[12],
+                    'weight_sentiment': row[13],
+                    'weight_breakout': row[14],
+                }
+            return None
+
+    def set(self, chat_id: int, key: str, value: Any):
+        with self.lock:
+            # Check if record exists
+            self.db.cursor.execute("SELECT chat_id FROM user_settings WHERE chat_id = ?", (chat_id,))
+            if self.db.cursor.fetchone():
+                self.db.cursor.execute(
+                    f"UPDATE user_settings SET {key} = ?, updated_at = ? WHERE chat_id = ?",
+                    (value, int(time.time()), chat_id)
+                )
+            else:
+                # Insert with defaults
+                defaults = {
+                    'symbols': ','.join(Config.SYMBOLS),
+                    'consensus_threshold': Config.CONSENSUS_THRESHOLD,
+                    'min_sources': Config.MIN_SOURCES,
+                    'volatility_min': Config.VOLATILITY_MIN,
+                    'per_trade_risk_pct': Config.PER_TRADE_RISK_PCT,
+                    'max_daily_loss_pct': Config.MAX_DAILY_LOSS_PCT,
+                    'max_drawdown': Config.MAX_DRAWDOWN,
+                    'max_positions_global': Config.MAX_POSITIONS_GLOBAL,
+                    'trend_filter': 1 if Config.TREND_FILTER else 0,
+                    'weight_ma': Config.SOURCE_WEIGHTS['technical_ma'],
+                    'weight_rsi': Config.SOURCE_WEIGHTS['technical_rsi'],
+                    'weight_sentiment': Config.SOURCE_WEIGHTS['sentiment'],
+                    'weight_breakout': Config.SOURCE_WEIGHTS['breakout'],
+                }
+                defaults[key] = value
+                self.db.cursor.execute('''
+                    INSERT INTO user_settings (
+                        chat_id, symbols, consensus_threshold, min_sources,
+                        volatility_min, per_trade_risk_pct, max_daily_loss_pct,
+                        max_drawdown, max_positions_global, trend_filter,
+                        weight_ma, weight_rsi, weight_sentiment, weight_breakout,
+                        updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    chat_id,
+                    defaults['symbols'],
+                    defaults['consensus_threshold'],
+                    defaults['min_sources'],
+                    defaults['volatility_min'],
+                    defaults['per_trade_risk_pct'],
+                    defaults['max_daily_loss_pct'],
+                    defaults['max_drawdown'],
+                    defaults['max_positions_global'],
+                    defaults['trend_filter'],
+                    defaults['weight_ma'],
+                    defaults['weight_rsi'],
+                    defaults['weight_sentiment'],
+                    defaults['weight_breakout'],
+                    int(time.time())
+                ))
+            self.db.conn.commit()
+
+    def reset(self, chat_id: int):
+        with self.lock:
+            self.db.cursor.execute("DELETE FROM user_settings WHERE chat_id = ?", (chat_id,))
+            self.db.conn.commit()
 
 # ---------------------------- CSV PERFORMANCE LOGGER ----------------------------
 class PerformanceLogger:
@@ -441,30 +567,37 @@ class RiskManager:
             total += len(positions)
         return total
 
-    def can_trade(self, symbol, price, atr, trend_ok):
+    def can_trade(self, symbol, price, atr, trend_ok, settings):
+        # Use settings or fallback to Config
+        max_daily_loss_pct = settings.get('max_daily_loss_pct', Config.MAX_DAILY_LOSS_PCT)
+        max_positions_global = settings.get('max_positions_global', Config.MAX_POSITIONS_GLOBAL)
+        max_drawdown = settings.get('max_drawdown', Config.MAX_DRAWDOWN)
+        consecutive_loss_limit = self.config['CONSECUTIVE_LOSS_LIMIT']  # this is not user-overridable yet, but could be
+        volatility_min = settings.get('volatility_min', Config.VOLATILITY_MIN)
         with self.lock:
-            if self.daily_pnl < -self.config['MAX_DAILY_LOSS_PCT'] * self.initial_balance:
+            if self.daily_pnl < -max_daily_loss_pct * self.initial_balance:
                 return False, "Daily loss limit"
-            if self.get_total_positions() >= self.config['MAX_POSITIONS_GLOBAL']:
+            if self.get_total_positions() >= max_positions_global:
                 return False, "Global max positions"
-            if self.open_positions.get(symbol, []) and len(self.open_positions[symbol]) >= self.config['MAX_POSITIONS_PER_SYMBOL']:
+            if self.open_positions.get(symbol, []) and len(self.open_positions[symbol]) >= Config.MAX_POSITIONS_PER_SYMBOL:  # not user-overridable
                 return False, "Max per symbol"
-            if self.consecutive_losses >= self.config['CONSECUTIVE_LOSS_LIMIT']:
+            if self.consecutive_losses >= Config.CONSECUTIVE_LOSS_LIMIT:
                 return False, "Consecutive loss limit"
-            if self.get_drawdown_pct() > self.config['MAX_DRAWDOWN']:
-                return False, f"Max drawdown ({self.config['MAX_DRAWDOWN']*100:.0f}%) reached"
+            if self.get_drawdown_pct() > max_drawdown:
+                return False, f"Max drawdown ({max_drawdown*100:.0f}%) reached"
             if atr is not None and atr > 0:
                 volatility = atr / price
-                if volatility < self.config['VOLATILITY_MIN']:
-                    return False, f"Volatility too low ({volatility*100:.2f}% < {self.config['VOLATILITY_MIN']*100:.2f}%)"
+                if volatility < volatility_min:
+                    return False, f"Volatility too low ({volatility*100:.2f}% < {volatility_min*100:.2f}%)"
                 if volatility > 0.10:
                     return False, f"Volatility too high ({volatility*100:.2f}%)"
             if Config.TREND_FILTER and not trend_ok:
                 return False, "Trend filter rejected"
             return True, "OK"
 
-    def compute_position_size(self, balance, price, atr):
-        risk_amount = balance * self.config['PER_TRADE_RISK_PCT']
+    def compute_position_size(self, balance, price, atr, settings):
+        per_trade_risk_pct = settings.get('per_trade_risk_pct', Config.PER_TRADE_RISK_PCT)
+        risk_amount = balance * per_trade_risk_pct
         if atr is None or atr == 0:
             atr = price * 0.02
         stop_distance = atr * 2.5
@@ -534,42 +667,60 @@ class LiveBroker:
         logger.info(f"[LIVE] {side} {size} {symbol} at {price}")
         return {"status": "live_placeholder"}
 
-# ---------------------------- MULTI-ASSET TRADER ----------------------------
+# ---------------------------- MULTI-ASSET TRADER (with dynamic settings) ----------------------------
 class MultiTrader:
     def __init__(self, symbols, initial_balance, risk_mgr, db, telegram_token, chat_id, live_broker):
-        valid_symbols = get_kucoin_symbols()
-        if valid_symbols:
-            self.symbols = [s for s in symbols if s in valid_symbols]
-            invalid = [s for s in symbols if s not in valid_symbols]
-            if invalid:
-                logger.warning(f"Skipping invalid symbols: {invalid}")
-            if not self.symbols:
-                logger.error("No valid symbols found. Falling back to defaults.")
-                self.symbols = ["BTC-USDT", "ETH-USDT", "SOL-USDT", "AVAX-USDT", "POL-USDT"]
-            logger.info(f"Active symbols: {self.symbols}")
-        else:
-            self.symbols = symbols
-            logger.warning("Could not fetch KuCoin symbols, using configured list.")
-
         self.db = db
         self.telegram_token = telegram_token
         self.chat_id = chat_id
         self.live_broker = live_broker
         self.risk_mgr = risk_mgr
         self.balance = initial_balance
+        self.settings_manager = SettingsManager(db)
+
+        # Load user settings if any
+        self.override_settings = None
+        if chat_id:
+            self.override_settings = self.settings_manager.get(int(chat_id))
+        self._init_symbols(symbols)
+        self._init_market_data()
+        self.running = True
+        self.performance_logger = PerformanceLogger(Config.CSV_FILE)
+        self.last_prices = {}
+
+    def _init_symbols(self, default_symbols):
+        if self.override_settings and 'symbols' in self.override_settings:
+            self.symbols = [s.strip() for s in self.override_settings['symbols'].split(',') if s.strip()]
+        else:
+            self.symbols = default_symbols
+        # validate against KuCoin
+        valid = get_kucoin_symbols()
+        if valid:
+            self.symbols = [s for s in self.symbols if s in valid]
+            if not self.symbols:
+                self.symbols = ["BTC-USDT", "ETH-USDT", "SOL-USDT", "AVAX-USDT", "POL-USDT"]
+                logger.warning("No valid symbols, falling back to defaults")
+        logger.info(f"Active symbols: {self.symbols}")
+
+    def _init_market_data(self):
         self.markets = {sym: MarketData(sym) for sym in self.symbols}
         self.consensus = ConsensusEngine()
         self.sources = {}
         for sym in self.symbols:
             self.sources[sym] = [
-                MASource(self.markets[sym], db),
-                RSISource(self.markets[sym], db),
-                SentimentSource(self.markets[sym], db),
-                BreakoutSource(self.markets[sym], db)
+                MASource(self.markets[sym], self.db),
+                RSISource(self.markets[sym], self.db),
+                SentimentSource(self.markets[sym], self.db),
+                BreakoutSource(self.markets[sym], self.db)
             ]
-        self.running = True
-        self.performance_logger = PerformanceLogger(Config.CSV_FILE)
-        self.last_prices = {}
+
+    def reload_settings(self):
+        if self.chat_id:
+            self.override_settings = self.settings_manager.get(int(self.chat_id))
+            # Re-init symbols if changed
+            self._init_symbols(Config.SYMBOLS)
+            self._init_market_data()
+            logger.info("Settings reloaded and market data updated")
 
     def send_alert(self, message):
         if not self.telegram_token or not self.chat_id:
@@ -617,12 +768,15 @@ class MultiTrader:
         return price, atr, trend_ok, trend_ma
 
     def execute_signal(self, symbol, direction, confidence, price, atr, details, sentiment_score, trend_ok):
-        can_trade, reason = self.risk_mgr.can_trade(symbol, price, atr, trend_ok)
+        # Load settings
+        settings = self.override_settings or {}
+        # Check risk
+        can_trade, reason = self.risk_mgr.can_trade(symbol, price, atr, trend_ok, settings)
         if not can_trade:
             logger.info(f"Trade blocked for {symbol}: {reason}")
             return
 
-        size = self.risk_mgr.compute_position_size(self.balance, price, atr)
+        size = self.risk_mgr.compute_position_size(self.balance, price, atr, settings)
         if size <= 0:
             return
         risk = atr * 2.5
@@ -649,7 +803,7 @@ class MultiTrader:
             f"Entry: ${price:.4f}\n"
             f"TP: ${take_profit:.4f} (+{(risk*1.5/price)*100:.2f}%)\n"
             f"SL: ${stop_loss:.4f} (-{(risk/price)*100:.2f}%)\n"
-            f"Risk: {self.risk_mgr.config['PER_TRADE_RISK_PCT']*100:.1f}%\n"
+            f"Risk: {settings.get('per_trade_risk_pct', Config.PER_TRADE_RISK_PCT)*100:.1f}%\n"
             f"Confidence: {confidence:.2f}\n"
             f"Sentiment: {sentiment_label}\n"
             f"Votes:\n{details_html}\n\n"
@@ -696,8 +850,19 @@ class MultiTrader:
                         sentiment = sig.direction
 
             if signals:
-                direction, conf, details = self.consensus.aggregate(signals)
-                if direction != 0 and conf >= Config.CONSENSUS_THRESHOLD:
+                # Use dynamic consensus params
+                threshold = self.override_settings.get('consensus_threshold', Config.CONSENSUS_THRESHOLD) if self.override_settings else Config.CONSENSUS_THRESHOLD
+                min_sources = self.override_settings.get('min_sources', Config.MIN_SOURCES) if self.override_settings else Config.MIN_SOURCES
+                weights = {
+                    'technical_ma': self.override_settings.get('weight_ma', Config.SOURCE_WEIGHTS['technical_ma']) if self.override_settings else Config.SOURCE_WEIGHTS['technical_ma'],
+                    'technical_rsi': self.override_settings.get('weight_rsi', Config.SOURCE_WEIGHTS['technical_rsi']) if self.override_settings else Config.SOURCE_WEIGHTS['technical_rsi'],
+                    'sentiment': self.override_settings.get('weight_sentiment', Config.SOURCE_WEIGHTS['sentiment']) if self.override_settings else Config.SOURCE_WEIGHTS['sentiment'],
+                    'breakout': self.override_settings.get('weight_breakout', Config.SOURCE_WEIGHTS['breakout']) if self.override_settings else Config.SOURCE_WEIGHTS['breakout'],
+                }
+                # Build temporary consensus engine
+                engine = ConsensusEngine(threshold=threshold, weights=weights, min_sources=min_sources)
+                direction, conf, details = engine.aggregate(signals)
+                if direction != 0 and conf >= threshold:
                     self.execute_signal(symbol, direction, conf, price, atr, details, sentiment, trend_ok)
 
             self.last_prices[symbol] = price
@@ -714,6 +879,16 @@ class MultiTrader:
 
     # ---------------------------- BACKTEST FUNCTION ----------------------------
     def backtest(self, symbol, lookback_days=30, timeframe='1hour'):
+        # Use current settings or defaults
+        settings = self.override_settings or {}
+        threshold = settings.get('consensus_threshold', Config.CONSENSUS_THRESHOLD)
+        min_sources = settings.get('min_sources', Config.MIN_SOURCES)
+        weights = {
+            'technical_ma': settings.get('weight_ma', Config.SOURCE_WEIGHTS['technical_ma']),
+            'technical_rsi': settings.get('weight_rsi', Config.SOURCE_WEIGHTS['technical_rsi']),
+            'sentiment': settings.get('weight_sentiment', Config.SOURCE_WEIGHTS['sentiment']),
+            'breakout': settings.get('weight_breakout', Config.SOURCE_WEIGHTS['breakout']),
+        }
         ohlcv = self.markets[symbol].get_ohlcv(limit=lookback_days*24, timeframe=timeframe)
         if ohlcv is None or len(ohlcv) < 50:
             return "Insufficient data for backtest."
@@ -721,6 +896,7 @@ class MultiTrader:
         pnl_list = []
         wins = 0
         losses = 0
+        engine = ConsensusEngine(threshold=threshold, weights=weights, min_sources=min_sources)
         for i in range(50, len(ohlcv)-1):
             current_ohlcv = ohlcv[:i+1]
             close = current_ohlcv[:, 3]
@@ -756,8 +932,8 @@ class MultiTrader:
                 active.append(Signal(sent_signal, 0.50, "sentiment"))
             if not active:
                 continue
-            direction, conf, details = self.consensus.aggregate(active)
-            if direction == 0 or conf < Config.CONSENSUS_THRESHOLD:
+            direction, conf, details = engine.aggregate(active)
+            if direction == 0 or conf < threshold:
                 continue
             next_price = ohlcv[i+1][3]
             entry_price = price
@@ -836,7 +1012,7 @@ trader_global = None
 
 @app.route('/')
 def health():
-    return jsonify({"status": "running", "version": "main-thread-telegram", "time": datetime.now().isoformat()})
+    return jsonify({"status": "running", "version": "settings-dashboard", "time": datetime.now().isoformat()})
 
 @app.route('/download')
 def download_csv():
@@ -861,7 +1037,7 @@ def get_main_keyboard():
     buttons = [
         [KeyboardButton("📊 Status"), KeyboardButton("🔍 Scan")],
         [KeyboardButton("📈 Performance"), KeyboardButton("⏸️ Pause"), KeyboardButton("▶️ Resume")],
-        [KeyboardButton("❓ Help")]
+        [KeyboardButton("⚙️ Settings"), KeyboardButton("❓ Help")]
     ]
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True, one_time_keyboard=False)
 
@@ -872,13 +1048,25 @@ async def start(update: Update, context):
         "Commands:\n"
         "/status – Account\n/scan – Force scan\n/performance – Stats\n"
         "/backtest <symbol> – Run backtest\n"
+        "/settings – View/Edit settings\n"
+        "/set <key> <value> – Change a setting\n"
+        "/reset – Reset to defaults\n"
         "/pause – Pause\n/resume – Resume\n/help – This\n\n"
         "💾 <a href='https://new-crypto-signals.onrender.com/download'>Download CSV</a>",
         parse_mode='HTML', reply_markup=get_main_keyboard(), disable_web_page_preview=True
     )
 
 async def help_cmd(update: Update, context):
-    await update.message.reply_text("Commands: /status, /scan, /performance, /backtest, /pause, /resume, /help", reply_markup=get_main_keyboard())
+    await update.message.reply_text(
+        "📋 <b>Commands</b>\n"
+        "/status – Account\n/scan – Force scan\n/performance – Stats\n"
+        "/backtest <symbol> – Run backtest\n"
+        "/settings – View/Edit settings\n"
+        "/set <key> <value> – Change a setting\n"
+        "/reset – Reset to defaults\n"
+        "/pause – Pause\n/resume – Resume\n/help – This",
+        parse_mode='HTML', reply_markup=get_main_keyboard()
+    )
 
 async def status_cmd(update: Update, context):
     logger.info(f"Received /status from {update.effective_user.id}")
@@ -974,7 +1162,18 @@ async def scan(update: Update, context):
             if sig and sig.direction != 0:
                 signals.append(sig)
         if signals:
-            direction, conf, details = trader_global.consensus.aggregate(signals)
+            # Use dynamic settings
+            settings = trader_global.override_settings or {}
+            threshold = settings.get('consensus_threshold', Config.CONSENSUS_THRESHOLD)
+            min_sources = settings.get('min_sources', Config.MIN_SOURCES)
+            weights = {
+                'technical_ma': settings.get('weight_ma', Config.SOURCE_WEIGHTS['technical_ma']),
+                'technical_rsi': settings.get('weight_rsi', Config.SOURCE_WEIGHTS['technical_rsi']),
+                'sentiment': settings.get('weight_sentiment', Config.SOURCE_WEIGHTS['sentiment']),
+                'breakout': settings.get('weight_breakout', Config.SOURCE_WEIGHTS['breakout']),
+            }
+            engine = ConsensusEngine(threshold=threshold, weights=weights, min_sources=min_sources)
+            direction, conf, details = engine.aggregate(signals)
             trend_info = f"Trend OK: {'✅' if trend_ok else '❌'}"
             msg = (
                 f"⚖️ {sym}: {'BUY' if direction==1 else 'SELL' if direction==-1 else 'NEUTRAL'}\n"
@@ -1000,6 +1199,109 @@ async def resume(update: Update, context):
         trader_global.running = True
     await update.message.reply_text("▶️ Resumed.", reply_markup=get_main_keyboard())
 
+# ---------- Settings Commands ----------
+async def settings_cmd(update: Update, context):
+    chat_id = update.effective_user.id
+    if trader_global is None:
+        await update.message.reply_text("Trader not ready.", reply_markup=get_main_keyboard())
+        return
+    settings = trader_global.settings_manager.get(chat_id)
+    if not settings:
+        # Show defaults
+        settings = {
+            'symbols': ','.join(Config.SYMBOLS),
+            'consensus_threshold': Config.CONSENSUS_THRESHOLD,
+            'min_sources': Config.MIN_SOURCES,
+            'volatility_min': Config.VOLATILITY_MIN,
+            'per_trade_risk_pct': Config.PER_TRADE_RISK_PCT,
+            'max_daily_loss_pct': Config.MAX_DAILY_LOSS_PCT,
+            'max_drawdown': Config.MAX_DRAWDOWN,
+            'max_positions_global': Config.MAX_POSITIONS_GLOBAL,
+            'trend_filter': Config.TREND_FILTER,
+            'weight_ma': Config.SOURCE_WEIGHTS['technical_ma'],
+            'weight_rsi': Config.SOURCE_WEIGHTS['technical_rsi'],
+            'weight_sentiment': Config.SOURCE_WEIGHTS['sentiment'],
+            'weight_breakout': Config.SOURCE_WEIGHTS['breakout'],
+        }
+    msg = (
+        "⚙️ <b>Your Trading Settings</b>\n\n"
+        f"📊 Symbols: <code>{settings['symbols']}</code>\n"
+        f"🎯 Consensus Threshold: {settings['consensus_threshold']}\n"
+        f"📊 Min Sources: {settings['min_sources']}\n"
+        f"📉 Volatility Min: {settings['volatility_min']}\n"
+        f"💵 Risk per Trade: {settings['per_trade_risk_pct']*100:.1f}%\n"
+        f"📉 Max Daily Loss: {settings['max_daily_loss_pct']*100:.1f}%\n"
+        f"📊 Max Drawdown: {settings['max_drawdown']*100:.1f}%\n"
+        f"📌 Max Positions: {settings['max_positions_global']}\n"
+        f"📈 Trend Filter: {'✅' if settings['trend_filter'] else '❌'}\n"
+        f"⚖️ Weight MA: {settings['weight_ma']}\n"
+        f"⚖️ Weight RSI: {settings['weight_rsi']}\n"
+        f"⚖️ Weight Sentiment: {settings['weight_sentiment']}\n"
+        f"⚖️ Weight Breakout: {settings['weight_breakout']}\n\n"
+        "Use /set <key> <value> to change, e.g.\n"
+        "<code>/set consensus_threshold 0.45</code>\n"
+        "<code>/set symbols BTC-USDT,ETH-USDT</code>\n"
+        "Or /reset to restore defaults."
+    )
+    await update.message.reply_text(msg, parse_mode='HTML', reply_markup=get_main_keyboard())
+
+async def set_cmd(update: Update, context):
+    chat_id = update.effective_user.id
+    args = context.args
+    if len(args) < 2:
+        await update.message.reply_text("Usage: /set <key> <value>\nExample: /set consensus_threshold 0.45", reply_markup=get_main_keyboard())
+        return
+    key = args[0]
+    value = ' '.join(args[1:])
+    # Convert type
+    if key in ['consensus_threshold', 'volatility_min', 'per_trade_risk_pct', 'max_daily_loss_pct', 'max_drawdown', 'weight_ma', 'weight_rsi', 'weight_sentiment', 'weight_breakout']:
+        try:
+            value = float(value)
+        except ValueError:
+            await update.message.reply_text(f"Invalid number for {key}.", reply_markup=get_main_keyboard())
+            return
+    elif key in ['min_sources', 'max_positions_global']:
+        try:
+            value = int(value)
+        except ValueError:
+            await update.message.reply_text(f"Invalid integer for {key}.", reply_markup=get_main_keyboard())
+            return
+    elif key == 'trend_filter':
+        value = value.lower() in ['true', '1', 'yes', 'on']
+    elif key == 'symbols':
+        # basic validation: comma-separated, dash separated
+        symbols = [s.strip() for s in value.split(',') if s.strip()]
+        if not symbols:
+            await update.message.reply_text("Symbols cannot be empty.", reply_markup=get_main_keyboard())
+            return
+        # optionally validate against KuCoin
+    else:
+        await update.message.reply_text(f"Unknown key: {key}. Available: symbols, consensus_threshold, min_sources, volatility_min, per_trade_risk_pct, max_daily_loss_pct, max_drawdown, max_positions_global, trend_filter, weight_ma, weight_rsi, weight_sentiment, weight_breakout", reply_markup=get_main_keyboard())
+        return
+    # Save setting
+    if trader_global:
+        trader_global.settings_manager.set(chat_id, key, value)
+        # Reload settings if symbol changed
+        if key == 'symbols':
+            trader_global.reload_settings()
+        else:
+            # For other settings, just reload the override dict
+            trader_global.override_settings = trader_global.settings_manager.get(chat_id)
+        await update.message.reply_text(f"✅ {key} set to {value}", reply_markup=get_main_keyboard())
+    else:
+        await update.message.reply_text("Trader not initialized.", reply_markup=get_main_keyboard())
+
+async def reset_cmd(update: Update, context):
+    chat_id = update.effective_user.id
+    if trader_global:
+        trader_global.settings_manager.reset(chat_id)
+        trader_global.override_settings = None
+        trader_global.reload_settings()
+        await update.message.reply_text("✅ All settings reset to defaults.", reply_markup=get_main_keyboard())
+    else:
+        await update.message.reply_text("Trader not ready.", reply_markup=get_main_keyboard())
+
+# ---------- Button handler ----------
 async def handle_button(update: Update, context):
     text = update.message.text
     logger.info(f"Button pressed: {text}")
@@ -1013,12 +1315,13 @@ async def handle_button(update: Update, context):
         await pause(update, context)
     elif text == "▶️ Resume":
         await resume(update, context)
+    elif text == "⚙️ Settings":
+        await settings_cmd(update, context)
     elif text == "❓ Help":
         await help_cmd(update, context)
 
 # ---------------------------- TELEGRAM RUNNER (Main Thread) ----------------------------
 def run_telegram():
-    """Run Telegram bot with infinite retry loop on the main thread."""
     if not Config.TELEGRAM_TOKEN:
         logger.warning("No Telegram token, skipping bot.")
         return
@@ -1035,6 +1338,9 @@ def run_telegram():
             app_tg.add_handler(CommandHandler("scan", scan))
             app_tg.add_handler(CommandHandler("pause", pause))
             app_tg.add_handler(CommandHandler("resume", resume))
+            app_tg.add_handler(CommandHandler("settings", settings_cmd))
+            app_tg.add_handler(CommandHandler("set", set_cmd))
+            app_tg.add_handler(CommandHandler("reset", reset_cmd))
             app_tg.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_button))
             logger.info("Telegram bot started, polling...")
             app_tg.run_polling()
@@ -1068,16 +1374,16 @@ if __name__ == "__main__":
     )
     trader_global = trader
 
-    # Start trading loop in a background daemon thread
+    # Start trading loop in background daemon thread
     threading.Thread(target=trader.run_loop, daemon=True).start()
 
-    # Start Flask server in a background daemon thread
+    # Start Flask server in background daemon thread
     threading.Thread(
         target=app.run,
         kwargs={'host': '0.0.0.0', 'port': int(os.getenv('PORT', 5000))},
         daemon=True
     ).start()
 
-    # Run Telegram bot on the main thread (so signal handlers work)
+    # Run Telegram bot on main thread (so signal handlers work)
     logger.info("Starting Telegram bot on main thread...")
     run_telegram()
