@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Multi-Asset Consensus Trading Bot – FINAL FIXED (with loop diagnostics & fallback)
+Multi-Asset Consensus Trading Bot – FINAL FIXED (Non‑daemon Loop)
 """
 
 import os
@@ -26,7 +26,7 @@ from telegram.error import Conflict
 
 load_dotenv()
 
-# ---------------------------- PID FILE (Robust) ----------------------------
+# ---------------------------- PID FILE ----------------------------
 PID_FILE = "bot.pid"
 
 def write_pid():
@@ -796,7 +796,7 @@ class LiveBroker:
         logger.info(f"[LIVE] {side} {size} {symbol} at {price}")
         return {"status": "live_placeholder"}
 
-# ---------------------------- MULTI-ASSET TRADER (with robust loop diagnostics) ----------------------------
+# ---------------------------- MULTI-ASSET TRADER (Non-daemon loop) ----------------------------
 class MultiTrader:
     def __init__(self, symbols, initial_balance, risk_mgr, db, telegram_token, chat_id, live_broker):
         self.db = db
@@ -825,19 +825,11 @@ class MultiTrader:
         else:
             logger.info("Optimization disabled (OPTIMIZE_ON_START=false)")
 
-        logger.info("Starting trading loop thread...")
-        self.loop_thread = threading.Thread(target=self._run_loop_wrapper, daemon=True)
+        # Start the trading loop in a non-daemon thread (so it keeps running)
+        logger.info("Starting trading loop in a NON-DAEMON thread...")
+        self.loop_thread = threading.Thread(target=self._run_loop_wrapper, daemon=False)
         self.loop_thread.start()
-        # Wait a bit to let the thread start
-        time.sleep(1)
-        if self.loop_thread.is_alive():
-            logger.info("Trading loop thread is alive.")
-        else:
-            logger.error("Trading loop thread failed to start! Will attempt fallback in main thread.")
-            # Fallback: start a non-daemon thread (which will keep running)
-            self.loop_thread = threading.Thread(target=self._run_loop_wrapper, daemon=False)
-            self.loop_thread.start()
-            logger.info("Fallback trading loop thread started (non-daemon).")
+        logger.info("Trading loop thread started (non-daemon).")
 
     def _init_symbols(self, default_symbols):
         if self.override_settings and 'symbols' in self.override_settings:
@@ -1221,7 +1213,7 @@ class MultiTrader:
                 logger.debug(f"STEP: No consensus for {symbol}")
 
     def _run_loop_wrapper(self):
-        logger.info("_run_loop_wrapper: Thread started.")
+        logger.info("_run_loop_wrapper: Thread started (non-daemon).")
         while True:
             try:
                 self.running = True
