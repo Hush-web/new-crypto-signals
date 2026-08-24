@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Multi-Asset Consensus Trading Bot – Final Production (Fixed None Settings)
+Multi-Asset Consensus Trading Bot – Final Production (Fixed Telegram Conflict)
 """
 
 import os
@@ -722,7 +722,7 @@ class LiveBroker:
         logger.info(f"[LIVE] {side} {size} {symbol} at {price}")
         return {"status": "live_placeholder"}
 
-# ---------------------------- MULTI-ASSET TRADER (fixed None settings) ----------------------------
+# ---------------------------- MULTI-ASSET TRADER (fixed None and conflict) ----------------------------
 class MultiTrader:
     def __init__(self, symbols, initial_balance, risk_mgr, db, telegram_token, chat_id, live_broker):
         self.db = db
@@ -985,13 +985,12 @@ class MultiTrader:
                 base_weights[k] /= total
         return base_weights
 
-    # ------------------------ MULTI-TIMEFRAME CONSENSUS (fixed None) ------------------------
+    # ------------------------ MULTI-TIMEFRAME CONSENSUS ------------------------
     def get_multi_tf_signal(self, symbol, price, atr, trend_ok):
         timeframes = ['15min', '1hour', '4hour']
         tf_directions = []
         tf_details = []
         weights = self.get_dynamic_weights(symbol, price, atr)
-        # FIX: use (self.override_settings or {}) to avoid None
         settings = self.override_settings or {}
         threshold = settings.get('consensus_threshold', Config.CONSENSUS_THRESHOLD)
         if symbol in self.optimal_thresholds:
@@ -1227,7 +1226,7 @@ def test_telegram():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# ---------------------------- TELEGRAM BOT ----------------------------
+# ---------------------------- TELEGRAM BOT (fixed conflict) ----------------------------
 def get_main_keyboard():
     buttons = [
         [KeyboardButton("📊 Status"), KeyboardButton("🔍 Scan")],
@@ -1625,32 +1624,42 @@ def start_trading_loop_with_restart(trader):
             time.sleep(10)
             continue
 
-# ---------------------------- TELEGRAM RUNNER ----------------------------
+# ---------------------------- TELEGRAM RUNNER (fixed conflict) ----------------------------
 def run_telegram():
     if not Config.TELEGRAM_TOKEN:
         logger.warning("No Telegram token, skipping bot.")
         return
+    # Create application once
+    app_tg = Application.builder().token(Config.TELEGRAM_TOKEN).build()
+    app_tg.add_handler(CommandHandler("start", start))
+    app_tg.add_handler(CommandHandler("help", help_cmd))
+    app_tg.add_handler(CommandHandler("ping", ping_cmd))
+    app_tg.add_handler(CommandHandler("status", status_cmd))
+    app_tg.add_handler(CommandHandler("performance", performance))
+    app_tg.add_handler(CommandHandler("backtest", backtest))
+    app_tg.add_handler(CommandHandler("scan", scan))
+    app_tg.add_handler(CommandHandler("pause", pause))
+    app_tg.add_handler(CommandHandler("resume", resume))
+    app_tg.add_handler(CommandHandler("restartloop", restartloop_cmd))
+    app_tg.add_handler(CommandHandler("settings", settings_cmd))
+    app_tg.add_handler(CommandHandler("set", set_cmd))
+    app_tg.add_handler(CommandHandler("reset", reset_cmd))
+    app_tg.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_button))
+
+    # Run polling with retry on conflict
     while True:
         try:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            app_tg = Application.builder().token(Config.TELEGRAM_TOKEN).build()
-            app_tg.add_handler(CommandHandler("start", start))
-            app_tg.add_handler(CommandHandler("help", help_cmd))
-            app_tg.add_handler(CommandHandler("ping", ping_cmd))
-            app_tg.add_handler(CommandHandler("status", status_cmd))
-            app_tg.add_handler(CommandHandler("performance", performance))
-            app_tg.add_handler(CommandHandler("backtest", backtest))
-            app_tg.add_handler(CommandHandler("scan", scan))
-            app_tg.add_handler(CommandHandler("pause", pause))
-            app_tg.add_handler(CommandHandler("resume", resume))
-            app_tg.add_handler(CommandHandler("restartloop", restartloop_cmd))
-            app_tg.add_handler(CommandHandler("settings", settings_cmd))
-            app_tg.add_handler(CommandHandler("set", set_cmd))
-            app_tg.add_handler(CommandHandler("reset", reset_cmd))
-            app_tg.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_button))
             logger.info("Telegram bot started, polling...")
             app_tg.run_polling()
+        except telegram.error.Conflict:
+            logger.warning("Conflict detected (another instance running). Stopping and retrying in 15 seconds...")
+            # Stop the application gracefully
+            try:
+                app_tg.stop()
+            except:
+                pass
+            time.sleep(15)
+            continue
         except Exception as e:
             logger.error(f"Telegram polling crashed: {e}. Restarting in 10 seconds...")
             time.sleep(10)
