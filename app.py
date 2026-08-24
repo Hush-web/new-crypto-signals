@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Multi-Asset Consensus Trading Bot – Final Production (Optimization in Background)
+Multi-Asset Consensus Trading Bot – Final Production (Fixed None Settings)
 """
 
 import os
@@ -722,7 +722,7 @@ class LiveBroker:
         logger.info(f"[LIVE] {side} {size} {symbol} at {price}")
         return {"status": "live_placeholder"}
 
-# ---------------------------- MULTI-ASSET TRADER (with background optimization) ----------------------------
+# ---------------------------- MULTI-ASSET TRADER (fixed None settings) ----------------------------
 class MultiTrader:
     def __init__(self, symbols, initial_balance, risk_mgr, db, telegram_token, chat_id, live_broker):
         self.db = db
@@ -744,10 +744,8 @@ class MultiTrader:
         self.last_prices = {}
         self.heartbeat_counter = 0
 
-        # Per-symbol optimized thresholds (populated by background optimization)
         self.optimal_thresholds = {}
 
-        # Start optimization in a background thread if enabled
         if Config.OPTIMIZE_ON_START:
             logger.info("Starting optimization in background thread...")
             threading.Thread(target=self.run_optimization, daemon=True).start()
@@ -787,7 +785,6 @@ class MultiTrader:
 
     # ------------------------ WALK-FORWARD OPTIMIZATION (background) ------------------------
     def run_optimization(self):
-        """Run walk-forward optimization for each symbol in background."""
         for sym in self.symbols:
             try:
                 logger.info(f"Running optimization for {sym}...")
@@ -988,13 +985,15 @@ class MultiTrader:
                 base_weights[k] /= total
         return base_weights
 
-    # ------------------------ MULTI-TIMEFRAME CONSENSUS ------------------------
+    # ------------------------ MULTI-TIMEFRAME CONSENSUS (fixed None) ------------------------
     def get_multi_tf_signal(self, symbol, price, atr, trend_ok):
         timeframes = ['15min', '1hour', '4hour']
         tf_directions = []
         tf_details = []
         weights = self.get_dynamic_weights(symbol, price, atr)
-        threshold = self.override_settings.get('consensus_threshold', Config.CONSENSUS_THRESHOLD)
+        # FIX: use (self.override_settings or {}) to avoid None
+        settings = self.override_settings or {}
+        threshold = settings.get('consensus_threshold', Config.CONSENSUS_THRESHOLD)
         if symbol in self.optimal_thresholds:
             threshold = self.optimal_thresholds[symbol]
 
@@ -1168,7 +1167,7 @@ class MultiTrader:
             ohlcv = self.markets[symbol].get_ohlcv(limit=lookback_days*24, timeframe=timeframe)
             if ohlcv is None or len(ohlcv) < 50:
                 return "Insufficient data for backtest."
-        threshold = self.override_settings.get('consensus_threshold', Config.CONSENSUS_THRESHOLD)
+        threshold = (self.override_settings or {}).get('consensus_threshold', Config.CONSENSUS_THRESHOLD)
         result = self._run_backtest_on_data(symbol, ohlcv, threshold=threshold, months=0)
         if result is None:
             return "No trades generated in backtest period."
