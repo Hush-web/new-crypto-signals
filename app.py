@@ -1,10 +1,6 @@
 #!/usr/bin/env python3
 """
-Multi-Asset Consensus Trading Bot – Full Settings Dashboard via Telegram
-- Dynamic configuration (consensus, risk, symbols, weights)
-- Persistent user settings in SQLite
-- All commands: /settings, /set, /reset
-- Keep-alive pinger to prevent Render sleep
+Multi-Asset Consensus Trading Bot – Full Settings Dashboard + Liveness Fix
 """
 
 import os
@@ -21,12 +17,12 @@ from datetime import datetime
 from typing import Optional, List, Tuple, Set, Dict, Any
 from dotenv import load_dotenv
 from flask import Flask, jsonify, send_file
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters, CallbackQueryHandler
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 load_dotenv()
 
-# ---------------------------- CONFIGURATION (from env) ----------------------------
+# ---------------------------- CONFIGURATION ----------------------------
 class Config:
     SYMBOLS = [s.strip().replace('/', '-') for s in os.getenv("SYMBOLS", "BTC-USDT,ETH-USDT,SOL-USDT,AVAX-USDT,POL-USDT").split(',') if s.strip()]
     INITIAL_BALANCE = float(os.getenv("INITIAL_BALANCE", "10000.0"))
@@ -106,7 +102,6 @@ class TradeDB:
         self.lock = threading.Lock()
 
     def _init_tables(self):
-        # trades table
         self.cursor.execute('''
             CREATE TABLE IF NOT EXISTS trades (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -120,7 +115,6 @@ class TradeDB:
                 balance REAL
             )
         ''')
-        # signals table
         self.cursor.execute('''
             CREATE TABLE IF NOT EXISTS signals (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -131,7 +125,6 @@ class TradeDB:
                 confidence REAL
             )
         ''')
-        # user_settings table
         self.cursor.execute('''
             CREATE TABLE IF NOT EXISTS user_settings (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -154,7 +147,6 @@ class TradeDB:
         ''')
         self.conn.commit()
 
-    # ---------- Existing methods ----------
     def log_trade(self, timestamp, symbol, side, price, size, fee=0.0, pnl=0.0, balance=0.0):
         with self.lock:
             self.cursor.execute(
@@ -222,7 +214,6 @@ class SettingsManager:
 
     def set(self, chat_id: int, key: str, value: Any):
         with self.lock:
-            # Check if record exists
             self.db.cursor.execute("SELECT chat_id FROM user_settings WHERE chat_id = ?", (chat_id,))
             if self.db.cursor.fetchone():
                 self.db.cursor.execute(
@@ -230,7 +221,6 @@ class SettingsManager:
                     (value, int(time.time()), chat_id)
                 )
             else:
-                # Insert with defaults
                 defaults = {
                     'symbols': ','.join(Config.SYMBOLS),
                     'consensus_threshold': Config.CONSENSUS_THRESHOLD,
@@ -869,7 +859,7 @@ class MultiTrader:
                 logger.error(f"Loop error: {e}", exc_info=True)
                 time.sleep(Config.TRADE_INTERVAL_SECONDS)
 
-    # ---------------------------- BACKTEST FUNCTION ----------------------------
+    # ---------------------------- BACKTEST ----------------------------
     def backtest(self, symbol, lookback_days=30, timeframe='1hour'):
         settings = self.override_settings or {}
         threshold = settings.get('consensus_threshold', Config.CONSENSUS_THRESHOLD)
@@ -1003,7 +993,7 @@ trader_global = None
 
 @app.route('/')
 def health():
-    return jsonify({"status": "running", "version": "settings-dashboard", "time": datetime.now().isoformat()})
+    return jsonify({"status": "running", "version": "liveness-fix", "time": datetime.now().isoformat()})
 
 @app.route('/download')
 def download_csv():
@@ -1032,7 +1022,13 @@ def get_main_keyboard():
     ]
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True, one_time_keyboard=False)
 
+# ---------- Liveness Check ----------
+async def ping_cmd(update: Update, context):
+    await update.message.reply_text("🏓 Pong! Bot is alive.", reply_markup=get_main_keyboard())
+
+# ---------- Immediate-reply wrappers ----------
 async def start(update: Update, context):
+    await update.message.reply_text("⏳ Processing...", reply_markup=get_main_keyboard())
     logger.info(f"Received /start from {update.effective_user.id}")
     await update.message.reply_text(
         "🤖 <b>Consensus Trader</b>\n\n"
@@ -1042,12 +1038,14 @@ async def start(update: Update, context):
         "/settings – View/Edit settings\n"
         "/set &lt;key&gt; &lt;value&gt; – Change a setting\n"
         "/reset – Reset to defaults\n"
+        "/ping – Liveness check\n"
         "/pause – Pause\n/resume – Resume\n/help – This\n\n"
         "💾 <a href='https://new-crypto-signals.onrender.com/download'>Download CSV</a>",
         parse_mode='HTML', reply_markup=get_main_keyboard(), disable_web_page_preview=True
     )
 
 async def help_cmd(update: Update, context):
+    await update.message.reply_text("⏳ Processing...", reply_markup=get_main_keyboard())
     await update.message.reply_text(
         "📋 <b>Commands</b>\n"
         "/status – Account\n/scan – Force scan\n/performance – Stats\n"
@@ -1055,11 +1053,13 @@ async def help_cmd(update: Update, context):
         "/settings – View/Edit settings\n"
         "/set &lt;key&gt; &lt;value&gt; – Change a setting\n"
         "/reset – Reset to defaults\n"
+        "/ping – Liveness check\n"
         "/pause – Pause\n/resume – Resume\n/help – This",
         parse_mode='HTML', reply_markup=get_main_keyboard()
     )
 
 async def status_cmd(update: Update, context):
+    await update.message.reply_text("⏳ Fetching status...", reply_markup=get_main_keyboard())
     logger.info(f"Received /status from {update.effective_user.id}")
     if trader_global is None:
         await update.message.reply_text("Trader not ready.", reply_markup=get_main_keyboard())
@@ -1075,6 +1075,7 @@ async def status_cmd(update: Update, context):
     await update.message.reply_text(safe_msg, parse_mode='HTML', reply_markup=get_main_keyboard())
 
 async def performance(update: Update, context):
+    await update.message.reply_text("⏳ Computing performance...", reply_markup=get_main_keyboard())
     logger.info(f"Received /performance from {update.effective_user.id}")
     if trader_global is None:
         await update.message.reply_text("Trader not ready.", reply_markup=get_main_keyboard())
@@ -1100,6 +1101,7 @@ async def performance(update: Update, context):
     await update.message.reply_text(safe_msg, parse_mode='HTML', reply_markup=get_main_keyboard())
 
 async def backtest(update: Update, context):
+    await update.message.reply_text("⏳ Running backtest...", reply_markup=get_main_keyboard())
     logger.info(f"Received /backtest from {update.effective_user.id}")
     if trader_global is None:
         await update.message.reply_text("Trader not ready.", reply_markup=get_main_keyboard())
@@ -1114,7 +1116,6 @@ async def backtest(update: Update, context):
     if symbol not in trader_global.symbols:
         await update.message.reply_text(f"Symbol {symbol} not active. Active: {', '.join(trader_global.symbols)}", reply_markup=get_main_keyboard())
         return
-    await update.message.reply_text(f"⏳ Running backtest for {symbol}...", reply_markup=get_main_keyboard())
     try:
         result = trader_global.backtest(symbol, lookback_days=30, timeframe='1hour')
         if isinstance(result, str):
@@ -1137,8 +1138,8 @@ async def backtest(update: Update, context):
         await update.message.reply_text(f"Backtest error: {e}", reply_markup=get_main_keyboard())
 
 async def scan(update: Update, context):
-    logger.info(f"Received /scan from {update.effective_user.id}")
     await update.message.reply_text("🔍 Scanning...", reply_markup=get_main_keyboard())
+    logger.info(f"Received /scan from {update.effective_user.id}")
     if trader_global is None:
         return
     for sym in trader_global.symbols:
@@ -1180,17 +1181,20 @@ async def scan(update: Update, context):
     await update.message.reply_text("✅ Scan complete.", reply_markup=get_main_keyboard())
 
 async def pause(update: Update, context):
+    await update.message.reply_text("⏳ Pausing...", reply_markup=get_main_keyboard())
     if trader_global:
         trader_global.running = False
     await update.message.reply_text("⏸️ Paused.", reply_markup=get_main_keyboard())
 
 async def resume(update: Update, context):
+    await update.message.reply_text("⏳ Resuming...", reply_markup=get_main_keyboard())
     if trader_global:
         trader_global.running = True
     await update.message.reply_text("▶️ Resumed.", reply_markup=get_main_keyboard())
 
 # ---------- Settings Commands ----------
 async def settings_cmd(update: Update, context):
+    await update.message.reply_text("⏳ Loading settings...", reply_markup=get_main_keyboard())
     chat_id = update.effective_user.id
     if trader_global is None:
         await update.message.reply_text("Trader not ready.", reply_markup=get_main_keyboard())
@@ -1275,6 +1279,7 @@ async def set_cmd(update: Update, context):
         await update.message.reply_text("Trader not initialized.", reply_markup=get_main_keyboard())
 
 async def reset_cmd(update: Update, context):
+    await update.message.reply_text("⏳ Resetting...", reply_markup=get_main_keyboard())
     chat_id = update.effective_user.id
     if trader_global:
         trader_global.settings_manager.reset(chat_id)
@@ -1314,7 +1319,7 @@ def keep_alive():
             logger.debug("Keep-alive ping sent")
         except Exception as e:
             logger.error(f"Keep-alive ping failed: {e}")
-        time.sleep(240)  # 4 minutes
+        time.sleep(240)
 
 # ---------------------------- TELEGRAM RUNNER (Main Thread) ----------------------------
 def run_telegram():
@@ -1328,6 +1333,7 @@ def run_telegram():
             app_tg = Application.builder().token(Config.TELEGRAM_TOKEN).build()
             app_tg.add_handler(CommandHandler("start", start))
             app_tg.add_handler(CommandHandler("help", help_cmd))
+            app_tg.add_handler(CommandHandler("ping", ping_cmd))
             app_tg.add_handler(CommandHandler("status", status_cmd))
             app_tg.add_handler(CommandHandler("performance", performance))
             app_tg.add_handler(CommandHandler("backtest", backtest))
