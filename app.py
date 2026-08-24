@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """
-Multi-Asset Consensus Trading Bot – Diagnostic Logging
+Multi-Asset Consensus Trading Bot – Diagnostic Final
+- Every scan step is logged (Scanning BTC-USDT...)
+- /loopstatus command to check trading loop health
+- Enhanced error handling and logging
 """
 
 import os
@@ -43,7 +46,7 @@ class Config:
     TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
     DB_FILE = os.getenv("DB_FILE", "trades.db")
     CSV_FILE = os.getenv("CSV_FILE", "trades.csv")
-    LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+    LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")  # ensure INFO or DEBUG
     OPTIMIZE_ON_START = os.getenv("OPTIMIZE_ON_START", "true").lower() == "true"
     OPTIMIZE_TRAIN_DAYS = int(os.getenv("OPTIMIZE_TRAIN_DAYS", "60"))
     OPTIMIZE_TEST_DAYS = int(os.getenv("OPTIMIZE_TEST_DAYS", "30"))
@@ -753,6 +756,12 @@ class MultiTrader:
         else:
             logger.info("Optimization disabled (OPTIMIZE_ON_START=false)")
 
+        # Start the trading loop immediately in a separate thread
+        logger.info("Starting trading loop thread...")
+        self.loop_thread = threading.Thread(target=self._run_loop_wrapper, daemon=True)
+        self.loop_thread.start()
+        logger.info("Trading loop thread started.")
+
     def _init_symbols(self, default_symbols):
         if self.override_settings and 'symbols' in self.override_settings:
             self.symbols = [s.strip() for s in self.override_settings['symbols'].split(',') if s.strip()]
@@ -1154,6 +1163,17 @@ class MultiTrader:
             else:
                 logger.debug(f"No consensus for {symbol}")
 
+    def _run_loop_wrapper(self):
+        """Wrapper that runs the trading loop with auto-restart."""
+        while True:
+            try:
+                self.running = True
+                self.run_loop()
+            except Exception as e:
+                logger.error(f"Trading loop crashed: {e}. Restarting in 10 seconds...", exc_info=True)
+                time.sleep(10)
+                continue
+
     def run_loop(self):
         logger.info("Starting multi-asset trading loop. Symbols: %s", self.symbols)
         while self.running:
@@ -1253,6 +1273,18 @@ async def ping_cmd(update: Update, context):
     except Exception as e:
         logger.error(f"Error in ping_cmd: {e}")
 
+async def loopstatus_cmd(update: Update, context):
+    """Check if the trading loop is alive."""
+    if trader_global is None:
+        await update.message.reply_text("Trader not initialized.", reply_markup=get_main_keyboard())
+        return
+    loop_alive = trader_global.loop_thread.is_alive() if hasattr(trader_global, 'loop_thread') else False
+    msg = (f"🔄 Trading Loop Status:\n"
+           f"Thread alive: {'✅' if loop_alive else '❌'}\n"
+           f"Running flag: {'✅' if trader_global.running else '❌'}\n"
+           f"Heartbeat count: {trader_global.heartbeat_counter}")
+    await update.message.reply_text(msg, reply_markup=get_main_keyboard())
+
 async def start(update: Update, context):
     try:
         await update.message.reply_text("⏳ Processing...", reply_markup=get_main_keyboard())
@@ -1266,6 +1298,7 @@ async def start(update: Update, context):
             "/set &lt;key&gt; &lt;value&gt; – Change a setting\n"
             "/reset – Reset to defaults\n"
             "/ping – Liveness check\n"
+            "/loopstatus – Check trading loop health\n"
             "/restartloop – Restart trading loop\n"
             "/pause – Pause\n/resume – Resume\n/help – This\n\n"
             "💾 <a href='https://new-crypto-signals.onrender.com/download'>Download CSV</a>",
@@ -1285,6 +1318,7 @@ async def help_cmd(update: Update, context):
             "/set &lt;key&gt; &lt;value&gt; – Change a setting\n"
             "/reset – Reset to defaults\n"
             "/ping – Liveness check\n"
+            "/loopstatus – Check trading loop health\n"
             "/restartloop – Restart trading loop\n"
             "/pause – Pause\n/resume – Resume\n/help – This",
             parse_mode='HTML', reply_markup=get_main_keyboard()
@@ -1473,7 +1507,9 @@ async def restartloop_cmd(update: Update, context):
         trader_global.running = False
         time.sleep(1)
         trader_global.running = True
-        threading.Thread(target=trader_global.run_loop, daemon=True).start()
+        # Start a new loop thread
+        trader_global.loop_thread = threading.Thread(target=trader_global._run_loop_wrapper, daemon=True)
+        trader_global.loop_thread.start()
         await update.message.reply_text("✅ Trading loop restarted.", reply_markup=get_main_keyboard())
     except Exception as e:
         logger.error(f"Error in restartloop: {e}")
@@ -1646,6 +1682,7 @@ def run_telegram():
     app_tg.add_handler(CommandHandler("start", start))
     app_tg.add_handler(CommandHandler("help", help_cmd))
     app_tg.add_handler(CommandHandler("ping", ping_cmd))
+    app_tg.add_handler(CommandHandler("loopstatus", loopstatus_cmd))
     app_tg.add_handler(CommandHandler("status", status_cmd))
     app_tg.add_handler(CommandHandler("performance", performance))
     app_tg.add_handler(CommandHandler("backtest", backtest))
@@ -1717,9 +1754,8 @@ if __name__ == "__main__":
     threading.Thread(target=keep_alive, daemon=True).start()
     logger.info("Keep-alive thread started.")
 
-    loop_thread = threading.Thread(target=start_trading_loop_with_restart, args=(trader,), daemon=True)
-    loop_thread.start()
-    logger.info("Trading loop thread started with auto-restart.")
+    # Start the trading loop thread (already started inside MultiTrader, but we keep the old method for fallback)
+    # The MultiTrader constructor already started a thread, so we don't need to start another.
 
     logger.info("Starting Telegram bot on main thread...")
     run_telegram()
