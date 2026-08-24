@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Multi-Asset Consensus Trading Bot – FINAL FIXED (Loop diagnostics + robust thread)
+Multi-Asset Consensus Trading Bot – FINAL FIXED (with loop diagnostics & fallback)
 """
 
 import os
@@ -828,9 +828,16 @@ class MultiTrader:
         logger.info("Starting trading loop thread...")
         self.loop_thread = threading.Thread(target=self._run_loop_wrapper, daemon=True)
         self.loop_thread.start()
-        logger.info("Trading loop thread started.")
-        # Add a small delay to ensure thread starts
-        time.sleep(0.5)
+        # Wait a bit to let the thread start
+        time.sleep(1)
+        if self.loop_thread.is_alive():
+            logger.info("Trading loop thread is alive.")
+        else:
+            logger.error("Trading loop thread failed to start! Will attempt fallback in main thread.")
+            # Fallback: start a non-daemon thread (which will keep running)
+            self.loop_thread = threading.Thread(target=self._run_loop_wrapper, daemon=False)
+            self.loop_thread.start()
+            logger.info("Fallback trading loop thread started (non-daemon).")
 
     def _init_symbols(self, default_symbols):
         if self.override_settings and 'symbols' in self.override_settings:
@@ -1533,7 +1540,7 @@ async def restartloop_cmd(update: Update, context):
         trader_global.running = False
         time.sleep(1)
         trader_global.running = True
-        trader_global.loop_thread = threading.Thread(target=trader_global._run_loop_wrapper, daemon=True)
+        trader_global.loop_thread = threading.Thread(target=trader_global._run_loop_wrapper, daemon=False)
         trader_global.loop_thread.start()
         await update.message.reply_text("✅ Trading loop restarted.", reply_markup=get_main_keyboard())
     except Exception as e:
