@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-Multi-Asset Consensus Trading Bot – Final Production Version
-Includes /test endpoint, startup message, and forced webhook cleanup.
+Multi-Asset Consensus Trading Bot – Production with Full Error Logging
 """
 
 import os
@@ -1028,98 +1027,115 @@ def get_main_keyboard():
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True, one_time_keyboard=False)
 
 async def ping_cmd(update: Update, context):
-    await update.message.reply_text("🏓 Pong! Bot is alive.", reply_markup=get_main_keyboard())
+    try:
+        await update.message.reply_text("🏓 Pong! Bot is alive.", reply_markup=get_main_keyboard())
+    except Exception as e:
+        logger.error(f"Error in ping_cmd: {e}")
 
 async def start(update: Update, context):
-    await update.message.reply_text("⏳ Processing...", reply_markup=get_main_keyboard())
-    logger.info(f"Received /start from {update.effective_user.id}")
-    await update.message.reply_text(
-        "🤖 <b>Consensus Trader</b>\n\n"
-        "Commands:\n"
-        "/status – Account\n/scan – Force scan\n/performance – Stats\n"
-        "/backtest <symbol> – Run backtest\n"
-        "/settings – View/Edit settings\n"
-        "/set &lt;key&gt; &lt;value&gt; – Change a setting\n"
-        "/reset – Reset to defaults\n"
-        "/ping – Liveness check\n"
-        "/pause – Pause\n/resume – Resume\n/help – This\n\n"
-        "💾 <a href='https://new-crypto-signals.onrender.com/download'>Download CSV</a>",
-        parse_mode='HTML', reply_markup=get_main_keyboard(), disable_web_page_preview=True
-    )
+    try:
+        await update.message.reply_text("⏳ Processing...", reply_markup=get_main_keyboard())
+        logger.info(f"Received /start from {update.effective_user.id}")
+        await update.message.reply_text(
+            "🤖 <b>Consensus Trader</b>\n\n"
+            "Commands:\n"
+            "/status – Account\n/scan – Force scan\n/performance – Stats\n"
+            "/backtest <symbol> – Run backtest\n"
+            "/settings – View/Edit settings\n"
+            "/set &lt;key&gt; &lt;value&gt; – Change a setting\n"
+            "/reset – Reset to defaults\n"
+            "/ping – Liveness check\n"
+            "/pause – Pause\n/resume – Resume\n/help – This\n\n"
+            "💾 <a href='https://new-crypto-signals.onrender.com/download'>Download CSV</a>",
+            parse_mode='HTML', reply_markup=get_main_keyboard(), disable_web_page_preview=True
+        )
+    except Exception as e:
+        logger.error(f"Error in start: {e}")
 
 async def help_cmd(update: Update, context):
-    await update.message.reply_text("⏳ Processing...", reply_markup=get_main_keyboard())
-    await update.message.reply_text(
-        "📋 <b>Commands</b>\n"
-        "/status – Account\n/scan – Force scan\n/performance – Stats\n"
-        "/backtest <symbol> – Run backtest\n"
-        "/settings – View/Edit settings\n"
-        "/set &lt;key&gt; &lt;value&gt; – Change a setting\n"
-        "/reset – Reset to defaults\n"
-        "/ping – Liveness check\n"
-        "/pause – Pause\n/resume – Resume\n/help – This",
-        parse_mode='HTML', reply_markup=get_main_keyboard()
-    )
+    try:
+        await update.message.reply_text("⏳ Processing...", reply_markup=get_main_keyboard())
+        await update.message.reply_text(
+            "📋 <b>Commands</b>\n"
+            "/status – Account\n/scan – Force scan\n/performance – Stats\n"
+            "/backtest <symbol> – Run backtest\n"
+            "/settings – View/Edit settings\n"
+            "/set &lt;key&gt; &lt;value&gt; – Change a setting\n"
+            "/reset – Reset to defaults\n"
+            "/ping – Liveness check\n"
+            "/pause – Pause\n/resume – Resume\n/help – This",
+            parse_mode='HTML', reply_markup=get_main_keyboard()
+        )
+    except Exception as e:
+        logger.error(f"Error in help: {e}")
 
 async def status_cmd(update: Update, context):
-    await update.message.reply_text("⏳ Fetching status...", reply_markup=get_main_keyboard())
-    logger.info(f"Received /status from {update.effective_user.id}")
-    if trader_global is None:
-        await update.message.reply_text("Trader not ready.", reply_markup=get_main_keyboard())
-        return
-    t = trader_global
-    drawdown = t.risk_mgr.get_drawdown_pct() * 100
-    msg = (
-        f"📊 <b>Status</b>\nBalance: ${t.balance:.2f}\nDaily PnL: ${t.db.get_daily_pnl():.2f}\n"
-        f"Open Positions: {t.risk_mgr.get_total_positions()}\n"
-        f"Drawdown: {drawdown:.2f}%\nRunning: {'✅' if t.running else '⏸️'}"
-    )
-    safe_msg = sanitize_html(msg)
-    await update.message.reply_text(safe_msg, parse_mode='HTML', reply_markup=get_main_keyboard())
+    try:
+        await update.message.reply_text("⏳ Fetching status...", reply_markup=get_main_keyboard())
+        logger.info(f"Received /status from {update.effective_user.id}")
+        if trader_global is None:
+            await update.message.reply_text("Trader not ready.", reply_markup=get_main_keyboard())
+            return
+        t = trader_global
+        drawdown = t.risk_mgr.get_drawdown_pct() * 100
+        msg = (
+            f"📊 <b>Status</b>\nBalance: ${t.balance:.2f}\nDaily PnL: ${t.db.get_daily_pnl():.2f}\n"
+            f"Open Positions: {t.risk_mgr.get_total_positions()}\n"
+            f"Drawdown: {drawdown:.2f}%\nRunning: {'✅' if t.running else '⏸️'}"
+        )
+        safe_msg = sanitize_html(msg)
+        logger.info("Sending final status message...")
+        await update.message.reply_text(safe_msg, parse_mode='HTML', reply_markup=get_main_keyboard())
+        logger.info("Status sent successfully.")
+    except Exception as e:
+        logger.error(f"Error in status_cmd: {e}", exc_info=True)
 
 async def performance(update: Update, context):
-    await update.message.reply_text("⏳ Computing performance...", reply_markup=get_main_keyboard())
-    logger.info(f"Received /performance from {update.effective_user.id}")
-    if trader_global is None:
-        await update.message.reply_text("Trader not ready.", reply_markup=get_main_keyboard())
-        return
-    summary = trader_global.performance_logger.get_summary()
-    if not summary:
-        await update.message.reply_text("No trades yet.", reply_markup=get_main_keyboard())
-        return
-    msg = (
-        f"📈 <b>Performance</b>\n"
-        f"Trades: {summary['total_trades']}\n"
-        f"Win Rate: {summary['win_rate']:.1f}%\n"
-        f"Total PnL: ${summary['total_pnl']:.2f}\n"
-        f"Avg Win: ${summary['avg_win']:.2f}\n"
-        f"Avg Loss: ${summary['avg_loss']:.2f}\n"
-        f"Best: ${summary['best_trade']:.2f}\n"
-        f"Worst: ${summary['worst_trade']:.2f}\n"
-        f"Max Drawdown: {summary['max_drawdown']*100:.2f}%\n"
-        f"Profit Factor: {summary['profit_factor']:.2f}\n"
-        f"Balance: ${summary['current_balance']:.2f}"
-    )
-    safe_msg = sanitize_html(msg)
-    await update.message.reply_text(safe_msg, parse_mode='HTML', reply_markup=get_main_keyboard())
+    try:
+        await update.message.reply_text("⏳ Computing performance...", reply_markup=get_main_keyboard())
+        logger.info(f"Received /performance from {update.effective_user.id}")
+        if trader_global is None:
+            await update.message.reply_text("Trader not ready.", reply_markup=get_main_keyboard())
+            return
+        summary = trader_global.performance_logger.get_summary()
+        if not summary:
+            await update.message.reply_text("No trades yet.", reply_markup=get_main_keyboard())
+            return
+        msg = (
+            f"📈 <b>Performance</b>\n"
+            f"Trades: {summary['total_trades']}\n"
+            f"Win Rate: {summary['win_rate']:.1f}%\n"
+            f"Total PnL: ${summary['total_pnl']:.2f}\n"
+            f"Avg Win: ${summary['avg_win']:.2f}\n"
+            f"Avg Loss: ${summary['avg_loss']:.2f}\n"
+            f"Best: ${summary['best_trade']:.2f}\n"
+            f"Worst: ${summary['worst_trade']:.2f}\n"
+            f"Max Drawdown: {summary['max_drawdown']*100:.2f}%\n"
+            f"Profit Factor: {summary['profit_factor']:.2f}\n"
+            f"Balance: ${summary['current_balance']:.2f}"
+        )
+        safe_msg = sanitize_html(msg)
+        await update.message.reply_text(safe_msg, parse_mode='HTML', reply_markup=get_main_keyboard())
+    except Exception as e:
+        logger.error(f"Error in performance: {e}", exc_info=True)
 
 async def backtest(update: Update, context):
-    await update.message.reply_text("⏳ Running backtest...", reply_markup=get_main_keyboard())
-    logger.info(f"Received /backtest from {update.effective_user.id}")
-    if trader_global is None:
-        await update.message.reply_text("Trader not ready.", reply_markup=get_main_keyboard())
-        return
-    args = context.args
-    if not args:
-        await update.message.reply_text("Usage: /backtest SYMBOL e.g., /backtest BTC-USDT", reply_markup=get_main_keyboard())
-        return
-    symbol = args[0].upper()
-    if '-' not in symbol:
-        symbol = symbol.replace('/', '-')
-    if symbol not in trader_global.symbols:
-        await update.message.reply_text(f"Symbol {symbol} not active. Active: {', '.join(trader_global.symbols)}", reply_markup=get_main_keyboard())
-        return
     try:
+        await update.message.reply_text("⏳ Running backtest...", reply_markup=get_main_keyboard())
+        logger.info(f"Received /backtest from {update.effective_user.id}")
+        if trader_global is None:
+            await update.message.reply_text("Trader not ready.", reply_markup=get_main_keyboard())
+            return
+        args = context.args
+        if not args:
+            await update.message.reply_text("Usage: /backtest SYMBOL e.g., /backtest BTC-USDT", reply_markup=get_main_keyboard())
+            return
+        symbol = args[0].upper()
+        if '-' not in symbol:
+            symbol = symbol.replace('/', '-')
+        if symbol not in trader_global.symbols:
+            await update.message.reply_text(f"Symbol {symbol} not active. Active: {', '.join(trader_global.symbols)}", reply_markup=get_main_keyboard())
+            return
         result = trader_global.backtest(symbol, lookback_days=30, timeframe='1hour')
         if isinstance(result, str):
             await update.message.reply_text(result, reply_markup=get_main_keyboard())
@@ -1138,178 +1154,198 @@ async def backtest(update: Update, context):
             safe_msg = sanitize_html(msg)
             await update.message.reply_text(safe_msg, parse_mode='HTML', reply_markup=get_main_keyboard())
     except Exception as e:
-        await update.message.reply_text(f"Backtest error: {e}", reply_markup=get_main_keyboard())
+        logger.error(f"Error in backtest: {e}", exc_info=True)
 
 async def scan(update: Update, context):
-    await update.message.reply_text("🔍 Scanning...", reply_markup=get_main_keyboard())
-    logger.info(f"Received /scan from {update.effective_user.id}")
-    if trader_global is None:
-        return
-    for sym in trader_global.symbols:
-        result = trader_global.get_price_and_atr(sym)
-        if result is None or result[0] is None:
-            await update.message.reply_text(f"⚠️ No data for {sym}")
-            continue
-        price, atr, trend_ok, trend_ma = result
-        signals = []
-        for src in trader_global.sources[sym]:
-            sig = src.fetch()
-            if sig and sig.direction != 0:
-                signals.append(sig)
-        if signals:
-            settings = trader_global.override_settings or {}
-            threshold = settings.get('consensus_threshold', Config.CONSENSUS_THRESHOLD)
-            min_sources = settings.get('min_sources', Config.MIN_SOURCES)
-            weights = {
-                'technical_ma': settings.get('weight_ma', Config.SOURCE_WEIGHTS['technical_ma']),
-                'technical_rsi': settings.get('weight_rsi', Config.SOURCE_WEIGHTS['technical_rsi']),
-                'sentiment': settings.get('weight_sentiment', Config.SOURCE_WEIGHTS['sentiment']),
-                'breakout': settings.get('weight_breakout', Config.SOURCE_WEIGHTS['breakout']),
-            }
-            engine = ConsensusEngine(threshold=threshold, weights=weights, min_sources=min_sources)
-            direction, conf, details = engine.aggregate(signals)
-            trend_info = f"Trend OK: {'✅' if trend_ok else '❌'}"
-            msg = (
-                f"⚖️ {sym}: {'BUY' if direction==1 else 'SELL' if direction==-1 else 'NEUTRAL'}\n"
-                f"Confidence: {conf:.2f}\n"
-                f"Price: ${price:.2f}\n"
-                f"Volatility: {(atr/price)*100:.2f}%\n"
-                f"Trend: {trend_info}\n"
-                f"Sources: {' | '.join([f'{s.source}:{s.direction} ({s.confidence:.2f})' for s in signals])}"
-            )
-            safe_msg = sanitize_html(msg)
-            await update.message.reply_text(safe_msg, reply_markup=get_main_keyboard())
-        else:
-            await update.message.reply_text(f"⚠️ No signals for {sym}", reply_markup=get_main_keyboard())
-    await update.message.reply_text("✅ Scan complete.", reply_markup=get_main_keyboard())
+    try:
+        await update.message.reply_text("🔍 Scanning...", reply_markup=get_main_keyboard())
+        logger.info(f"Received /scan from {update.effective_user.id}")
+        if trader_global is None:
+            return
+        for sym in trader_global.symbols:
+            result = trader_global.get_price_and_atr(sym)
+            if result is None or result[0] is None:
+                await update.message.reply_text(f"⚠️ No data for {sym}")
+                continue
+            price, atr, trend_ok, trend_ma = result
+            signals = []
+            for src in trader_global.sources[sym]:
+                sig = src.fetch()
+                if sig and sig.direction != 0:
+                    signals.append(sig)
+            if signals:
+                settings = trader_global.override_settings or {}
+                threshold = settings.get('consensus_threshold', Config.CONSENSUS_THRESHOLD)
+                min_sources = settings.get('min_sources', Config.MIN_SOURCES)
+                weights = {
+                    'technical_ma': settings.get('weight_ma', Config.SOURCE_WEIGHTS['technical_ma']),
+                    'technical_rsi': settings.get('weight_rsi', Config.SOURCE_WEIGHTS['technical_rsi']),
+                    'sentiment': settings.get('weight_sentiment', Config.SOURCE_WEIGHTS['sentiment']),
+                    'breakout': settings.get('weight_breakout', Config.SOURCE_WEIGHTS['breakout']),
+                }
+                engine = ConsensusEngine(threshold=threshold, weights=weights, min_sources=min_sources)
+                direction, conf, details = engine.aggregate(signals)
+                trend_info = f"Trend OK: {'✅' if trend_ok else '❌'}"
+                msg = (
+                    f"⚖️ {sym}: {'BUY' if direction==1 else 'SELL' if direction==-1 else 'NEUTRAL'}\n"
+                    f"Confidence: {conf:.2f}\n"
+                    f"Price: ${price:.2f}\n"
+                    f"Volatility: {(atr/price)*100:.2f}%\n"
+                    f"Trend: {trend_info}\n"
+                    f"Sources: {' | '.join([f'{s.source}:{s.direction} ({s.confidence:.2f})' for s in signals])}"
+                )
+                safe_msg = sanitize_html(msg)
+                await update.message.reply_text(safe_msg, reply_markup=get_main_keyboard())
+            else:
+                await update.message.reply_text(f"⚠️ No signals for {sym}", reply_markup=get_main_keyboard())
+        await update.message.reply_text("✅ Scan complete.", reply_markup=get_main_keyboard())
+    except Exception as e:
+        logger.error(f"Error in scan: {e}", exc_info=True)
 
 async def pause(update: Update, context):
-    await update.message.reply_text("⏳ Pausing...", reply_markup=get_main_keyboard())
-    if trader_global:
-        trader_global.running = False
-    await update.message.reply_text("⏸️ Paused.", reply_markup=get_main_keyboard())
+    try:
+        await update.message.reply_text("⏳ Pausing...", reply_markup=get_main_keyboard())
+        if trader_global:
+            trader_global.running = False
+        await update.message.reply_text("⏸️ Paused.", reply_markup=get_main_keyboard())
+    except Exception as e:
+        logger.error(f"Error in pause: {e}")
 
 async def resume(update: Update, context):
-    await update.message.reply_text("⏳ Resuming...", reply_markup=get_main_keyboard())
-    if trader_global:
-        trader_global.running = True
-    await update.message.reply_text("▶️ Resumed.", reply_markup=get_main_keyboard())
+    try:
+        await update.message.reply_text("⏳ Resuming...", reply_markup=get_main_keyboard())
+        if trader_global:
+            trader_global.running = True
+        await update.message.reply_text("▶️ Resumed.", reply_markup=get_main_keyboard())
+    except Exception as e:
+        logger.error(f"Error in resume: {e}")
 
-# ---------- Settings Commands ----------
 async def settings_cmd(update: Update, context):
-    await update.message.reply_text("⏳ Loading settings...", reply_markup=get_main_keyboard())
-    chat_id = update.effective_user.id
-    if trader_global is None:
-        await update.message.reply_text("Trader not ready.", reply_markup=get_main_keyboard())
-        return
-    settings = trader_global.settings_manager.get(chat_id)
-    if not settings:
-        settings = {
-            'symbols': ','.join(Config.SYMBOLS),
-            'consensus_threshold': Config.CONSENSUS_THRESHOLD,
-            'min_sources': Config.MIN_SOURCES,
-            'volatility_min': Config.VOLATILITY_MIN,
-            'per_trade_risk_pct': Config.PER_TRADE_RISK_PCT,
-            'max_daily_loss_pct': Config.MAX_DAILY_LOSS_PCT,
-            'max_drawdown': Config.MAX_DRAWDOWN,
-            'max_positions_global': Config.MAX_POSITIONS_GLOBAL,
-            'trend_filter': Config.TREND_FILTER,
-            'weight_ma': Config.SOURCE_WEIGHTS['technical_ma'],
-            'weight_rsi': Config.SOURCE_WEIGHTS['technical_rsi'],
-            'weight_sentiment': Config.SOURCE_WEIGHTS['sentiment'],
-            'weight_breakout': Config.SOURCE_WEIGHTS['breakout'],
-        }
-    msg = (
-        "⚙️ <b>Your Trading Settings</b>\n\n"
-        f"📊 Symbols: <code>{settings['symbols']}</code>\n"
-        f"🎯 Consensus Threshold: {settings['consensus_threshold']}\n"
-        f"📊 Min Sources: {settings['min_sources']}\n"
-        f"📉 Volatility Min: {settings['volatility_min']}\n"
-        f"💵 Risk per Trade: {settings['per_trade_risk_pct']*100:.1f}%\n"
-        f"📉 Max Daily Loss: {settings['max_daily_loss_pct']*100:.1f}%\n"
-        f"📊 Max Drawdown: {settings['max_drawdown']*100:.1f}%\n"
-        f"📌 Max Positions: {settings['max_positions_global']}\n"
-        f"📈 Trend Filter: {'✅' if settings['trend_filter'] else '❌'}\n"
-        f"⚖️ Weight MA: {settings['weight_ma']}\n"
-        f"⚖️ Weight RSI: {settings['weight_rsi']}\n"
-        f"⚖️ Weight Sentiment: {settings['weight_sentiment']}\n"
-        f"⚖️ Weight Breakout: {settings['weight_breakout']}\n\n"
-        "Use /set &lt;key&gt; &lt;value&gt; to change, e.g.\n"
-        "<code>/set consensus_threshold 0.45</code>\n"
-        "<code>/set symbols BTC-USDT,ETH-USDT</code>\n"
-        "Or /reset to restore defaults."
-    )
-    await update.message.reply_text(msg, parse_mode='HTML', reply_markup=get_main_keyboard())
+    try:
+        await update.message.reply_text("⏳ Loading settings...", reply_markup=get_main_keyboard())
+        chat_id = update.effective_user.id
+        if trader_global is None:
+            await update.message.reply_text("Trader not ready.", reply_markup=get_main_keyboard())
+            return
+        settings = trader_global.settings_manager.get(chat_id)
+        if not settings:
+            settings = {
+                'symbols': ','.join(Config.SYMBOLS),
+                'consensus_threshold': Config.CONSENSUS_THRESHOLD,
+                'min_sources': Config.MIN_SOURCES,
+                'volatility_min': Config.VOLATILITY_MIN,
+                'per_trade_risk_pct': Config.PER_TRADE_RISK_PCT,
+                'max_daily_loss_pct': Config.MAX_DAILY_LOSS_PCT,
+                'max_drawdown': Config.MAX_DRAWDOWN,
+                'max_positions_global': Config.MAX_POSITIONS_GLOBAL,
+                'trend_filter': Config.TREND_FILTER,
+                'weight_ma': Config.SOURCE_WEIGHTS['technical_ma'],
+                'weight_rsi': Config.SOURCE_WEIGHTS['technical_rsi'],
+                'weight_sentiment': Config.SOURCE_WEIGHTS['sentiment'],
+                'weight_breakout': Config.SOURCE_WEIGHTS['breakout'],
+            }
+        msg = (
+            "⚙️ <b>Your Trading Settings</b>\n\n"
+            f"📊 Symbols: <code>{settings['symbols']}</code>\n"
+            f"🎯 Consensus Threshold: {settings['consensus_threshold']}\n"
+            f"📊 Min Sources: {settings['min_sources']}\n"
+            f"📉 Volatility Min: {settings['volatility_min']}\n"
+            f"💵 Risk per Trade: {settings['per_trade_risk_pct']*100:.1f}%\n"
+            f"📉 Max Daily Loss: {settings['max_daily_loss_pct']*100:.1f}%\n"
+            f"📊 Max Drawdown: {settings['max_drawdown']*100:.1f}%\n"
+            f"📌 Max Positions: {settings['max_positions_global']}\n"
+            f"📈 Trend Filter: {'✅' if settings['trend_filter'] else '❌'}\n"
+            f"⚖️ Weight MA: {settings['weight_ma']}\n"
+            f"⚖️ Weight RSI: {settings['weight_rsi']}\n"
+            f"⚖️ Weight Sentiment: {settings['weight_sentiment']}\n"
+            f"⚖️ Weight Breakout: {settings['weight_breakout']}\n\n"
+            "Use /set &lt;key&gt; &lt;value&gt; to change, e.g.\n"
+            "<code>/set consensus_threshold 0.45</code>\n"
+            "<code>/set symbols BTC-USDT,ETH-USDT</code>\n"
+            "Or /reset to restore defaults."
+        )
+        await update.message.reply_text(msg, parse_mode='HTML', reply_markup=get_main_keyboard())
+    except Exception as e:
+        logger.error(f"Error in settings: {e}", exc_info=True)
 
 async def set_cmd(update: Update, context):
-    chat_id = update.effective_user.id
-    args = context.args
-    if len(args) < 2:
-        await update.message.reply_text("Usage: /set &lt;key&gt; &lt;value&gt;\nExample: /set consensus_threshold 0.45", reply_markup=get_main_keyboard())
-        return
-    key = args[0]
-    value = ' '.join(args[1:])
-    if key in ['consensus_threshold', 'volatility_min', 'per_trade_risk_pct', 'max_daily_loss_pct', 'max_drawdown', 'weight_ma', 'weight_rsi', 'weight_sentiment', 'weight_breakout']:
-        try:
-            value = float(value)
-        except ValueError:
-            await update.message.reply_text(f"Invalid number for {key}.", reply_markup=get_main_keyboard())
+    try:
+        chat_id = update.effective_user.id
+        args = context.args
+        if len(args) < 2:
+            await update.message.reply_text("Usage: /set &lt;key&gt; &lt;value&gt;\nExample: /set consensus_threshold 0.45", reply_markup=get_main_keyboard())
             return
-    elif key in ['min_sources', 'max_positions_global']:
-        try:
-            value = int(value)
-        except ValueError:
-            await update.message.reply_text(f"Invalid integer for {key}.", reply_markup=get_main_keyboard())
-            return
-    elif key == 'trend_filter':
-        value = value.lower() in ['true', '1', 'yes', 'on']
-    elif key == 'symbols':
-        symbols = [s.strip() for s in value.split(',') if s.strip()]
-        if not symbols:
-            await update.message.reply_text("Symbols cannot be empty.", reply_markup=get_main_keyboard())
-            return
-    else:
-        await update.message.reply_text(f"Unknown key: {key}. Available: symbols, consensus_threshold, min_sources, volatility_min, per_trade_risk_pct, max_daily_loss_pct, max_drawdown, max_positions_global, trend_filter, weight_ma, weight_rsi, weight_sentiment, weight_breakout", reply_markup=get_main_keyboard())
-        return
-    if trader_global:
-        trader_global.settings_manager.set(chat_id, key, value)
-        if key == 'symbols':
-            trader_global.reload_settings()
+        key = args[0]
+        value = ' '.join(args[1:])
+        if key in ['consensus_threshold', 'volatility_min', 'per_trade_risk_pct', 'max_daily_loss_pct', 'max_drawdown', 'weight_ma', 'weight_rsi', 'weight_sentiment', 'weight_breakout']:
+            try:
+                value = float(value)
+            except ValueError:
+                await update.message.reply_text(f"Invalid number for {key}.", reply_markup=get_main_keyboard())
+                return
+        elif key in ['min_sources', 'max_positions_global']:
+            try:
+                value = int(value)
+            except ValueError:
+                await update.message.reply_text(f"Invalid integer for {key}.", reply_markup=get_main_keyboard())
+                return
+        elif key == 'trend_filter':
+            value = value.lower() in ['true', '1', 'yes', 'on']
+        elif key == 'symbols':
+            symbols = [s.strip() for s in value.split(',') if s.strip()]
+            if not symbols:
+                await update.message.reply_text("Symbols cannot be empty.", reply_markup=get_main_keyboard())
+                return
         else:
-            trader_global.override_settings = trader_global.settings_manager.get(chat_id)
-        await update.message.reply_text(f"✅ {key} set to {value}", reply_markup=get_main_keyboard())
-    else:
-        await update.message.reply_text("Trader not initialized.", reply_markup=get_main_keyboard())
+            await update.message.reply_text(f"Unknown key: {key}. Available: symbols, consensus_threshold, min_sources, volatility_min, per_trade_risk_pct, max_daily_loss_pct, max_drawdown, max_positions_global, trend_filter, weight_ma, weight_rsi, weight_sentiment, weight_breakout", reply_markup=get_main_keyboard())
+            return
+        if trader_global:
+            trader_global.settings_manager.set(chat_id, key, value)
+            if key == 'symbols':
+                trader_global.reload_settings()
+            else:
+                trader_global.override_settings = trader_global.settings_manager.get(chat_id)
+            await update.message.reply_text(f"✅ {key} set to {value}", reply_markup=get_main_keyboard())
+        else:
+            await update.message.reply_text("Trader not initialized.", reply_markup=get_main_keyboard())
+    except Exception as e:
+        logger.error(f"Error in set_cmd: {e}", exc_info=True)
 
 async def reset_cmd(update: Update, context):
-    await update.message.reply_text("⏳ Resetting...", reply_markup=get_main_keyboard())
-    chat_id = update.effective_user.id
-    if trader_global:
-        trader_global.settings_manager.reset(chat_id)
-        trader_global.override_settings = None
-        trader_global.reload_settings()
-        await update.message.reply_text("✅ All settings reset to defaults.", reply_markup=get_main_keyboard())
-    else:
-        await update.message.reply_text("Trader not ready.", reply_markup=get_main_keyboard())
+    try:
+        await update.message.reply_text("⏳ Resetting...", reply_markup=get_main_keyboard())
+        chat_id = update.effective_user.id
+        if trader_global:
+            trader_global.settings_manager.reset(chat_id)
+            trader_global.override_settings = None
+            trader_global.reload_settings()
+            await update.message.reply_text("✅ All settings reset to defaults.", reply_markup=get_main_keyboard())
+        else:
+            await update.message.reply_text("Trader not ready.", reply_markup=get_main_keyboard())
+    except Exception as e:
+        logger.error(f"Error in reset: {e}", exc_info=True)
 
 # ---------- Button handler ----------
 async def handle_button(update: Update, context):
-    text = update.message.text
-    logger.info(f"Button pressed: {text}")
-    if text == "📊 Status":
-        await status_cmd(update, context)
-    elif text == "🔍 Scan":
-        await scan(update, context)
-    elif text == "📈 Performance":
-        await performance(update, context)
-    elif text == "⏸️ Pause":
-        await pause(update, context)
-    elif text == "▶️ Resume":
-        await resume(update, context)
-    elif text == "⚙️ Settings":
-        await settings_cmd(update, context)
-    elif text == "❓ Help":
-        await help_cmd(update, context)
+    try:
+        text = update.message.text
+        logger.info(f"Button pressed: {text}")
+        if text == "📊 Status":
+            await status_cmd(update, context)
+        elif text == "🔍 Scan":
+            await scan(update, context)
+        elif text == "📈 Performance":
+            await performance(update, context)
+        elif text == "⏸️ Pause":
+            await pause(update, context)
+        elif text == "▶️ Resume":
+            await resume(update, context)
+        elif text == "⚙️ Settings":
+            await settings_cmd(update, context)
+        elif text == "❓ Help":
+            await help_cmd(update, context)
+    except Exception as e:
+        logger.error(f"Error in handle_button: {e}", exc_info=True)
 
 # ---------------------------- KEEP-ALIVE ----------------------------
 def keep_alive():
