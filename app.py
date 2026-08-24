@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 """
-Multi-Asset Consensus Trading Bot – FINAL FIXED with Debug Logging
-- Added STEP and LOOP logging
-- Optimisation disabled by default
+Multi-Asset Consensus Trading Bot – FINAL FIXED (Loop diagnostics + robust thread)
 """
 
 import os
@@ -97,7 +95,7 @@ if not check_and_clean_pid():
 write_pid()
 atexit.register(remove_pid)
 
-# ---------------------------- CONFIGURATION (Optimisation off by default) ----------------------------
+# ---------------------------- CONFIGURATION ----------------------------
 class Config:
     SYMBOLS = [s.strip().replace('/', '-') for s in os.getenv("SYMBOLS", "BTC-USDT,ETH-USDT,SOL-USDT,AVAX-USDT,POL-USDT").split(',') if s.strip()]
     INITIAL_BALANCE = float(os.getenv("INITIAL_BALANCE", "10000.0"))
@@ -118,7 +116,7 @@ class Config:
     DB_FILE = os.getenv("DB_FILE", "trades.db")
     CSV_FILE = os.getenv("CSV_FILE", "trades.csv")
     LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
-    OPTIMIZE_ON_START = os.getenv("OPTIMIZE_ON_START", "false").lower() == "true"  # Disabled by default
+    OPTIMIZE_ON_START = os.getenv("OPTIMIZE_ON_START", "false").lower() == "true"
     OPTIMIZE_TRAIN_DAYS = int(os.getenv("OPTIMIZE_TRAIN_DAYS", "60"))
     OPTIMIZE_TEST_DAYS = int(os.getenv("OPTIMIZE_TEST_DAYS", "30"))
     BACKTEST_MONTHS = int(os.getenv("BACKTEST_MONTHS", "12"))
@@ -798,7 +796,7 @@ class LiveBroker:
         logger.info(f"[LIVE] {side} {size} {symbol} at {price}")
         return {"status": "live_placeholder"}
 
-# ---------------------------- MULTI-ASSET TRADER (with debug logging) ----------------------------
+# ---------------------------- MULTI-ASSET TRADER (with robust loop diagnostics) ----------------------------
 class MultiTrader:
     def __init__(self, symbols, initial_balance, risk_mgr, db, telegram_token, chat_id, live_broker):
         self.db = db
@@ -831,6 +829,8 @@ class MultiTrader:
         self.loop_thread = threading.Thread(target=self._run_loop_wrapper, daemon=True)
         self.loop_thread.start()
         logger.info("Trading loop thread started.")
+        # Add a small delay to ensure thread starts
+        time.sleep(0.5)
 
     def _init_symbols(self, default_symbols):
         if self.override_settings and 'symbols' in self.override_settings:
@@ -1214,6 +1214,7 @@ class MultiTrader:
                 logger.debug(f"STEP: No consensus for {symbol}")
 
     def _run_loop_wrapper(self):
+        logger.info("_run_loop_wrapper: Thread started.")
         while True:
             try:
                 self.running = True
