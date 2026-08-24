@@ -4,6 +4,7 @@ Multi-Asset Consensus Trading Bot – Full Settings Dashboard via Telegram
 - Dynamic configuration (consensus, risk, symbols, weights)
 - Persistent user settings in SQLite
 - All commands: /settings, /set, /reset
+- Keep-alive pinger to prevent Render sleep
 """
 
 import os
@@ -130,7 +131,7 @@ class TradeDB:
                 confidence REAL
             )
         ''')
-        # user_settings table (new)
+        # user_settings table
         self.cursor.execute('''
             CREATE TABLE IF NOT EXISTS user_settings (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -568,11 +569,9 @@ class RiskManager:
         return total
 
     def can_trade(self, symbol, price, atr, trend_ok, settings):
-        # Use settings or fallback to Config
         max_daily_loss_pct = settings.get('max_daily_loss_pct', Config.MAX_DAILY_LOSS_PCT)
         max_positions_global = settings.get('max_positions_global', Config.MAX_POSITIONS_GLOBAL)
         max_drawdown = settings.get('max_drawdown', Config.MAX_DRAWDOWN)
-        consecutive_loss_limit = self.config['CONSECUTIVE_LOSS_LIMIT']  # not overridable currently
         volatility_min = settings.get('volatility_min', Config.VOLATILITY_MIN)
         with self.lock:
             if self.daily_pnl < -max_daily_loss_pct * self.initial_balance:
@@ -667,7 +666,7 @@ class LiveBroker:
         logger.info(f"[LIVE] {side} {size} {symbol} at {price}")
         return {"status": "live_placeholder"}
 
-# ---------------------------- MULTI-ASSET TRADER (with dynamic settings) ----------------------------
+# ---------------------------- MULTI-ASSET TRADER ----------------------------
 class MultiTrader:
     def __init__(self, symbols, initial_balance, risk_mgr, db, telegram_token, chat_id, live_broker):
         self.db = db
@@ -678,7 +677,6 @@ class MultiTrader:
         self.balance = initial_balance
         self.settings_manager = SettingsManager(db)
 
-        # Load user settings if any
         self.override_settings = None
         if chat_id:
             self.override_settings = self.settings_manager.get(int(chat_id))
@@ -693,7 +691,6 @@ class MultiTrader:
             self.symbols = [s.strip() for s in self.override_settings['symbols'].split(',') if s.strip()]
         else:
             self.symbols = default_symbols
-        # validate against KuCoin
         valid = get_kucoin_symbols()
         if valid:
             self.symbols = [s for s in self.symbols if s in valid]
@@ -717,7 +714,6 @@ class MultiTrader:
     def reload_settings(self):
         if self.chat_id:
             self.override_settings = self.settings_manager.get(int(self.chat_id))
-            # Re-init symbols if changed
             self._init_symbols(Config.SYMBOLS)
             self._init_market_data()
             logger.info("Settings reloaded and market data updated")
@@ -768,9 +764,7 @@ class MultiTrader:
         return price, atr, trend_ok, trend_ma
 
     def execute_signal(self, symbol, direction, confidence, price, atr, details, sentiment_score, trend_ok):
-        # Load settings
         settings = self.override_settings or {}
-        # Check risk
         can_trade, reason = self.risk_mgr.can_trade(symbol, price, atr, trend_ok, settings)
         if not can_trade:
             logger.info(f"Trade blocked for {symbol}: {reason}")
@@ -850,7 +844,6 @@ class MultiTrader:
                         sentiment = sig.direction
 
             if signals:
-                # Use dynamic consensus params
                 threshold = self.override_settings.get('consensus_threshold', Config.CONSENSUS_THRESHOLD) if self.override_settings else Config.CONSENSUS_THRESHOLD
                 min_sources = self.override_settings.get('min_sources', Config.MIN_SOURCES) if self.override_settings else Config.MIN_SOURCES
                 weights = {
@@ -859,7 +852,6 @@ class MultiTrader:
                     'sentiment': self.override_settings.get('weight_sentiment', Config.SOURCE_WEIGHTS['sentiment']) if self.override_settings else Config.SOURCE_WEIGHTS['sentiment'],
                     'breakout': self.override_settings.get('weight_breakout', Config.SOURCE_WEIGHTS['breakout']) if self.override_settings else Config.SOURCE_WEIGHTS['breakout'],
                 }
-                # Build temporary consensus engine
                 engine = ConsensusEngine(threshold=threshold, weights=weights, min_sources=min_sources)
                 direction, conf, details = engine.aggregate(signals)
                 if direction != 0 and conf >= threshold:
@@ -879,7 +871,6 @@ class MultiTrader:
 
     # ---------------------------- BACKTEST FUNCTION ----------------------------
     def backtest(self, symbol, lookback_days=30, timeframe='1hour'):
-        # Use current settings or defaults
         settings = self.override_settings or {}
         threshold = settings.get('consensus_threshold', Config.CONSENSUS_THRESHOLD)
         min_sources = settings.get('min_sources', Config.MIN_SOURCES)
@@ -1162,7 +1153,6 @@ async def scan(update: Update, context):
             if sig and sig.direction != 0:
                 signals.append(sig)
         if signals:
-            # Use dynamic settings
             settings = trader_global.override_settings or {}
             threshold = settings.get('consensus_threshold', Config.CONSENSUS_THRESHOLD)
             min_sources = settings.get('min_sources', Config.MIN_SOURCES)
@@ -1207,7 +1197,6 @@ async def settings_cmd(update: Update, context):
         return
     settings = trader_global.settings_manager.get(chat_id)
     if not settings:
-        # Show defaults
         settings = {
             'symbols': ','.join(Config.SYMBOLS),
             'consensus_threshold': Config.CONSENSUS_THRESHOLD,
@@ -1253,7 +1242,6 @@ async def set_cmd(update: Update, context):
         return
     key = args[0]
     value = ' '.join(args[1:])
-    # Convert type
     if key in ['consensus_threshold', 'volatility_min', 'per_trade_risk_pct', 'max_daily_loss_pct', 'max_drawdown', 'weight_ma', 'weight_rsi', 'weight_sentiment', 'weight_breakout']:
         try:
             value = float(value)
@@ -1269,23 +1257,18 @@ async def set_cmd(update: Update, context):
     elif key == 'trend_filter':
         value = value.lower() in ['true', '1', 'yes', 'on']
     elif key == 'symbols':
-        # basic validation: comma-separated, dash separated
         symbols = [s.strip() for s in value.split(',') if s.strip()]
         if not symbols:
             await update.message.reply_text("Symbols cannot be empty.", reply_markup=get_main_keyboard())
             return
-        # optionally validate against KuCoin
     else:
         await update.message.reply_text(f"Unknown key: {key}. Available: symbols, consensus_threshold, min_sources, volatility_min, per_trade_risk_pct, max_daily_loss_pct, max_drawdown, max_positions_global, trend_filter, weight_ma, weight_rsi, weight_sentiment, weight_breakout", reply_markup=get_main_keyboard())
         return
-    # Save setting
     if trader_global:
         trader_global.settings_manager.set(chat_id, key, value)
-        # Reload settings if symbol changed
         if key == 'symbols':
             trader_global.reload_settings()
         else:
-            # For other settings, just reload the override dict
             trader_global.override_settings = trader_global.settings_manager.get(chat_id)
         await update.message.reply_text(f"✅ {key} set to {value}", reply_markup=get_main_keyboard())
     else:
@@ -1319,6 +1302,19 @@ async def handle_button(update: Update, context):
         await settings_cmd(update, context)
     elif text == "❓ Help":
         await help_cmd(update, context)
+
+# ---------------------------- KEEP-ALIVE FUNCTION ----------------------------
+def keep_alive():
+    """Ping the local Flask server every 4 minutes to prevent Render from sleeping."""
+    port = os.getenv('PORT', 5000)
+    url = f"http://localhost:{port}/"
+    while True:
+        try:
+            requests.get(url, timeout=5)
+            logger.debug("Keep-alive ping sent")
+        except Exception as e:
+            logger.error(f"Keep-alive ping failed: {e}")
+        time.sleep(240)  # 4 minutes
 
 # ---------------------------- TELEGRAM RUNNER (Main Thread) ----------------------------
 def run_telegram():
@@ -1384,6 +1380,10 @@ if __name__ == "__main__":
         daemon=True
     ).start()
 
-    # Run Telegram bot on main thread (so signal handlers work)
+    # Start keep-alive thread (internal pinger)
+    threading.Thread(target=keep_alive, daemon=True).start()
+    logger.info("Keep-alive thread started.")
+
+    # Run Telegram bot on main thread
     logger.info("Starting Telegram bot on main thread...")
     run_telegram()
