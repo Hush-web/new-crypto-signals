@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """
-Multi-Asset Consensus Trading Bot – FINAL FIXED (Non‑daemon Loop)
+Multi-Asset Consensus Trading Bot – FINAL DEFINITIVE FIX
+- Non-daemon loop with file marker and heartbeat counter
+- Aggressive logging to both logger and stdout
 """
 
 import os
@@ -140,6 +142,13 @@ logging.basicConfig(
     level=getattr(logging, Config.LOG_LEVEL)
 )
 logger = logging.getLogger("multi-trader")
+
+# Also print to stdout directly
+def debug_print(msg):
+    print(f"[DEBUG] {msg}")
+    sys.stdout.flush()
+
+debug_print("Script started.")
 
 # ---------------------------- HTML SANITIZER ----------------------------
 def sanitize_html(text: str) -> str:
@@ -796,9 +805,10 @@ class LiveBroker:
         logger.info(f"[LIVE] {side} {size} {symbol} at {price}")
         return {"status": "live_placeholder"}
 
-# ---------------------------- MULTI-ASSET TRADER (Non-daemon loop) ----------------------------
+# ---------------------------- MULTI-ASSET TRADER (with aggressive loop logging) ----------------------------
 class MultiTrader:
     def __init__(self, symbols, initial_balance, risk_mgr, db, telegram_token, chat_id, live_broker):
+        debug_print("MultiTrader __init__ entered.")
         self.db = db
         self.telegram_token = telegram_token
         self.chat_id = chat_id
@@ -825,11 +835,27 @@ class MultiTrader:
         else:
             logger.info("Optimization disabled (OPTIMIZE_ON_START=false)")
 
-        # Start the trading loop in a non-daemon thread (so it keeps running)
+        # Start a simple heartbeat thread to prove it's alive
+        debug_print("Starting heartbeat thread...")
+        self.heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=False)
+        self.heartbeat_thread.start()
+        debug_print("Heartbeat thread started.")
+
+        # Now start the trading loop in a non-daemon thread
         logger.info("Starting trading loop in a NON-DAEMON thread...")
         self.loop_thread = threading.Thread(target=self._run_loop_wrapper, daemon=False)
         self.loop_thread.start()
         logger.info("Trading loop thread started (non-daemon).")
+        debug_print("Trading loop thread started.")
+
+    def _heartbeat_loop(self):
+        """Simple loop that increments a counter and prints to stdout every 10 seconds."""
+        counter = 0
+        while True:
+            counter += 1
+            print(f"[HEARTBEAT] Counter: {counter} (PID: {os.getpid()})")
+            sys.stdout.flush()
+            time.sleep(10)
 
     def _init_symbols(self, default_symbols):
         if self.override_settings and 'symbols' in self.override_settings:
@@ -1213,7 +1239,7 @@ class MultiTrader:
                 logger.debug(f"STEP: No consensus for {symbol}")
 
     def _run_loop_wrapper(self):
-        logger.info("_run_loop_wrapper: Thread started (non-daemon).")
+        debug_print("_run_loop_wrapper: Thread started (non-daemon).")
         while True:
             try:
                 self.running = True
@@ -1225,8 +1251,10 @@ class MultiTrader:
 
     def run_loop(self):
         logger.info("Starting multi-asset trading loop. Symbols: %s", self.symbols)
+        debug_print("run_loop: Entered main loop.")
         while self.running:
             logger.info("LOOP: Iteration")
+            debug_print("LOOP: Iteration")
             try:
                 self.step()
                 self.heartbeat_counter += 1
@@ -1729,6 +1757,7 @@ def run_telegram():
 
 # ---------------------------- MAIN ----------------------------
 if __name__ == "__main__":
+    debug_print("Entering main.")
     db = TradeDB(Config.DB_FILE)
     risk_mgr = RiskManager(Config.INITIAL_BALANCE, {
         'MAX_DAILY_LOSS_PCT': Config.MAX_DAILY_LOSS_PCT,
@@ -1741,6 +1770,7 @@ if __name__ == "__main__":
     })
     live_broker = LiveBroker(Config.EXCHANGE_NAME, Config.EXCHANGE_API_KEY, Config.EXCHANGE_SECRET)
 
+    debug_print("Creating MultiTrader instance...")
     trader = MultiTrader(
         symbols=Config.SYMBOLS,
         initial_balance=Config.INITIAL_BALANCE,
@@ -1751,6 +1781,7 @@ if __name__ == "__main__":
         live_broker=live_broker
     )
     trader_global = trader
+    debug_print("MultiTrader instance created. trader_global set.")
 
     if trader.telegram_token and trader.chat_id:
         try:
@@ -1758,14 +1789,16 @@ if __name__ == "__main__":
         except Exception as e:
             logger.error(f"Startup message failed: {e}")
 
+    debug_print("Starting Flask thread...")
     threading.Thread(
         target=app.run,
         kwargs={'host': '0.0.0.0', 'port': int(os.getenv('PORT', 5000))},
         daemon=True
     ).start()
 
+    debug_print("Starting keep-alive thread...")
     threading.Thread(target=keep_alive, daemon=True).start()
     logger.info("Keep-alive thread started.")
 
-    logger.info("Starting Telegram bot on main thread...")
+    debug_print("Starting Telegram bot on main thread...")
     run_telegram()
