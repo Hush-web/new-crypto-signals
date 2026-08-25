@@ -3,6 +3,7 @@
 Multi-Asset Consensus Trading Bot – FINAL DEFINITIVE FIX
 - Non-daemon loop with file marker and heartbeat counter
 - Aggressive logging to both logger and stdout
+- Fixed override_settings NoneType error
 """
 
 import os
@@ -805,7 +806,7 @@ class LiveBroker:
         logger.info(f"[LIVE] {side} {size} {symbol} at {price}")
         return {"status": "live_placeholder"}
 
-# ---------------------------- MULTI-ASSET TRADER (with aggressive loop logging) ----------------------------
+# ---------------------------- MULTI-ASSET TRADER (with all fixes) ----------------------------
 class MultiTrader:
     def __init__(self, symbols, initial_balance, risk_mgr, db, telegram_token, chat_id, live_broker):
         debug_print("MultiTrader __init__ entered.")
@@ -1093,6 +1094,7 @@ class MultiTrader:
         tf_directions = []
         tf_details = []
         weights = self.get_dynamic_weights(symbol, price, atr)
+        # FIX: override_settings might be None, so use {} as fallback
         settings = self.override_settings or {}
         threshold = settings.get('consensus_threshold', Config.CONSENSUS_THRESHOLD)
         if symbol in self.optimal_thresholds:
