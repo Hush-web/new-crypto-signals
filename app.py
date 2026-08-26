@@ -1,9 +1,6 @@
 #!/usr/bin/env python3
 """
-Multi-Asset Consensus Trading Bot – FINAL DEFINITIVE FIX
-- Non-daemon loop with file marker and heartbeat counter
-- Aggressive logging to both logger and stdout
-- Fixed override_settings NoneType error
+Multi-Asset Consensus Trading Bot – FINAL WITH VERSION & TEST TRADE
 """
 
 import os
@@ -104,7 +101,7 @@ class Config:
     INITIAL_BALANCE = float(os.getenv("INITIAL_BALANCE", "10000.0"))
     MAX_POSITIONS_GLOBAL = int(os.getenv("MAX_POSITIONS_GLOBAL", "5"))
     MAX_POSITIONS_PER_SYMBOL = int(os.getenv("MAX_POSITIONS_PER_SYMBOL", "1"))
-    PER_TRADE_RISK_PCT = float(os.getenv("PER_TRADE_RISK_PCT", "0.02"))
+    PER_TRADE_RISK_PCT = float(os.getenv("PER_TRADE_RISK_PCT", "0.01"))  # 1% risk per trade
     MAX_DAILY_LOSS_PCT = float(os.getenv("MAX_DAILY_LOSS_PCT", "0.05"))
     MAX_DRAWDOWN = float(os.getenv("MAX_DRAWDOWN", "0.10"))
     CONSENSUS_THRESHOLD = float(os.getenv("CONSENSUS_THRESHOLD", "0.25"))
@@ -144,7 +141,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("multi-trader")
 
-# Also print to stdout directly
 def debug_print(msg):
     print(f"[DEBUG] {msg}")
     sys.stdout.flush()
@@ -806,7 +802,7 @@ class LiveBroker:
         logger.info(f"[LIVE] {side} {size} {symbol} at {price}")
         return {"status": "live_placeholder"}
 
-# ---------------------------- MULTI-ASSET TRADER (with all fixes) ----------------------------
+# ---------------------------- MULTI-ASSET TRADER (with full logging & test commands) ----------------------------
 class MultiTrader:
     def __init__(self, symbols, initial_balance, risk_mgr, db, telegram_token, chat_id, live_broker):
         debug_print("MultiTrader __init__ entered.")
@@ -819,6 +815,13 @@ class MultiTrader:
         self.balance_lock = threading.Lock()
         self.settings_manager = SettingsManager(db)
 
+        logger.info(f"STARTUP CONFIG: INITIAL_BALANCE={initial_balance}, PER_TRADE_RISK_PCT={Config.PER_TRADE_RISK_PCT}")
+        if initial_balance <= 0:
+            logger.warning("INITIAL_BALANCE is <= 0! Trades will not open.")
+        if Config.PER_TRADE_RISK_PCT <= 0:
+            logger.warning("PER_TRADE_RISK_PCT is <= 0! Setting to 0.01 (1%) as fallback.")
+            Config.PER_TRADE_RISK_PCT = 0.01
+
         self.override_settings = None
         if chat_id:
             self.override_settings = self.settings_manager.get(int(chat_id))
@@ -829,6 +832,7 @@ class MultiTrader:
         self.last_prices = {}
         self.heartbeat_counter = 0
         self.optimal_thresholds = {}
+        self.loop_thread = None
 
         if Config.OPTIMIZE_ON_START:
             logger.info("Starting optimization in background thread...")
@@ -836,21 +840,32 @@ class MultiTrader:
         else:
             logger.info("Optimization disabled (OPTIMIZE_ON_START=false)")
 
-        # Start a simple heartbeat thread to prove it's alive
         debug_print("Starting heartbeat thread...")
         self.heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=False)
         self.heartbeat_thread.start()
         debug_print("Heartbeat thread started.")
 
-        # Now start the trading loop in a non-daemon thread
-        logger.info("Starting trading loop in a NON-DAEMON thread...")
+        self._start_loop_thread()
+
+        debug_print("Starting loop monitor thread...")
+        self.monitor_thread = threading.Thread(target=self._monitor_loop, daemon=False)
+        self.monitor_thread.start()
+        debug_print("Loop monitor thread started.")
+
+    def _start_loop_thread(self):
+        debug_print("Starting trading loop thread...")
         self.loop_thread = threading.Thread(target=self._run_loop_wrapper, daemon=False)
         self.loop_thread.start()
-        logger.info("Trading loop thread started (non-daemon).")
-        debug_print("Trading loop thread started.")
+        debug_print(f"Trading loop thread started (daemon={self.loop_thread.daemon}).")
+
+    def _monitor_loop(self):
+        while True:
+            if self.loop_thread is None or not self.loop_thread.is_alive():
+                debug_print("Loop thread is dead or None. Restarting...")
+                self._start_loop_thread()
+            time.sleep(10)
 
     def _heartbeat_loop(self):
-        """Simple loop that increments a counter and prints to stdout every 10 seconds."""
         counter = 0
         while True:
             counter += 1
@@ -1094,7 +1109,6 @@ class MultiTrader:
         tf_directions = []
         tf_details = []
         weights = self.get_dynamic_weights(symbol, price, atr)
-        # FIX: override_settings might be None, so use {} as fallback
         settings = self.override_settings or {}
         threshold = settings.get('consensus_threshold', Config.CONSENSUS_THRESHOLD)
         if symbol in self.optimal_thresholds:
@@ -1163,29 +1177,38 @@ class MultiTrader:
     def execute_signal(self, symbol, direction, price, atr, tf_details, trend_ok):
         logger.info(f"execute_signal called for {symbol}, direction={direction}")
         settings = self.override_settings or {}
+        
         can_trade, reason = self.risk_mgr.can_trade(symbol, price, atr, trend_ok, settings)
+        logger.info(f"can_trade result: {can_trade}, reason: {reason}")
         if not can_trade:
             logger.info(f"Trade blocked for {symbol}: {reason}")
             return
 
         size = self.risk_mgr.compute_position_size(self.balance, price, atr, settings)
+        logger.info(f"Computed size: {size}")
         if size <= 0:
+            logger.warning(f"Position size zero for {symbol} (balance={self.balance}, price={price}, atr={atr})")
             return
+
         risk = atr * 2.5
         stop_loss = price - risk if direction == 1 else price + risk
         take_profit = price + risk * 1.5 if direction == 1 else price - risk * 1.5
         side = 'buy' if direction == 1 else 'sell'
         cost = price * size
+        logger.info(f"cost: {cost}, balance: {self.balance}")
 
         with self.balance_lock:
             if side == 'buy':
                 if self.balance < cost:
                     self.send_alert(f"⚠️ Insufficient balance for {symbol}")
+                    logger.warning(f"Insufficient balance: {self.balance} < {cost}")
                     return
                 self.balance -= cost
+                logger.info(f"Balance after buy: {self.balance}")
 
         self.risk_mgr.open_position(symbol, side, price, size, stop_loss, take_profit)
         self.db.log_trade(int(time.time()), symbol, side, price, size, 0.0, 0.0, self.balance)
+        logger.info(f"Trade opened for {symbol}: {side} {size:.4f} @ {price:.2f}")
 
         details_html = "<br>".join([sanitize_html(f"• {d}") for d in tf_details])
         msg = (
@@ -1248,12 +1271,13 @@ class MultiTrader:
                 self.run_loop()
             except Exception as e:
                 logger.error(f"Trading loop crashed: {e}. Restarting in 10 seconds...", exc_info=True)
+                debug_print(f"Trading loop crashed: {e}")
                 time.sleep(10)
                 continue
 
     def run_loop(self):
-        logger.info("Starting multi-asset trading loop. Symbols: %s", self.symbols)
         debug_print("run_loop: Entered main loop.")
+        logger.info("Starting multi-asset trading loop. Symbols: %s", self.symbols)
         while self.running:
             logger.info("LOOP: Iteration")
             debug_print("LOOP: Iteration")
@@ -1265,6 +1289,7 @@ class MultiTrader:
                 time.sleep(Config.TRADE_INTERVAL_SECONDS)
             except Exception as e:
                 logger.error(f"Loop error: {e}", exc_info=True)
+                debug_print(f"Loop error: {e}")
                 time.sleep(Config.TRADE_INTERVAL_SECONDS)
 
     def backtest(self, symbol, lookback_days=30, timeframe='1hour'):
@@ -1337,7 +1362,7 @@ def test_telegram():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# ---------------------------- TELEGRAM BOT ----------------------------
+# ---------------------------- TELEGRAM BOT (with /version and /testtrade) ----------------------------
 def get_main_keyboard():
     buttons = [
         [KeyboardButton("📊 Status"), KeyboardButton("🔍 Scan")],
@@ -1360,6 +1385,22 @@ async def loopstatus_cmd(update: Update, context):
            f"Heartbeat count: {trader_global.heartbeat_counter}")
     await update.message.reply_text(msg, reply_markup=get_main_keyboard())
 
+async def version_cmd(update: Update, context):
+    await update.message.reply_text("Version: 2026-08-26-01 (with full logging and test commands)", reply_markup=get_main_keyboard())
+
+async def testtrade_cmd(update: Update, context):
+    if trader_global is None:
+        await update.message.reply_text("Trader not initialized.", reply_markup=get_main_keyboard())
+        return
+    symbol = "BTC-USDT"
+    price = 78619.10
+    atr = price * 0.0073
+    direction = 1
+    trend_ok = True
+    tf_details = ["test"]
+    trader_global.execute_signal(symbol, direction, price, atr, tf_details, trend_ok)
+    await update.message.reply_text("Test trade executed. Check logs.", reply_markup=get_main_keyboard())
+
 async def start(update: Update, context):
     try:
         await update.message.reply_text("⏳ Processing...", reply_markup=get_main_keyboard())
@@ -1375,7 +1416,9 @@ async def start(update: Update, context):
             "/ping – Liveness check\n"
             "/loopstatus – Check trading loop health\n"
             "/restartloop – Restart trading loop\n"
-            "/pause – Pause\n/resume – Resume\n/help – This\n\n"
+            "/pause – Pause\n/resume – Resume\n/help – This\n"
+            "/version – Show deployed version\n"
+            "/testtrade – Force a test trade (BTC BUY)\n\n"
             "💾 <a href='https://new-crypto-signals.onrender.com/download'>Download CSV</a>",
             parse_mode='HTML', reply_markup=get_main_keyboard(), disable_web_page_preview=True
         )
@@ -1393,7 +1436,9 @@ async def help_cmd(update: Update, context):
         "/ping – Liveness check\n"
         "/loopstatus – Check trading loop health\n"
         "/restartloop – Restart trading loop\n"
-        "/pause – Pause\n/resume – Resume\n/help – This",
+        "/pause – Pause\n/resume – Resume\n/help – This\n"
+        "/version – Show deployed version\n"
+        "/testtrade – Force a test trade (BTC BUY)",
         parse_mode='HTML', reply_markup=get_main_keyboard()
     )
 
@@ -1562,8 +1607,7 @@ async def restartloop_cmd(update: Update, context):
         trader_global.running = False
         time.sleep(1)
         trader_global.running = True
-        trader_global.loop_thread = threading.Thread(target=trader_global._run_loop_wrapper, daemon=False)
-        trader_global.loop_thread.start()
+        trader_global._start_loop_thread()
         await update.message.reply_text("✅ Trading loop restarted.", reply_markup=get_main_keyboard())
     except Exception as e:
         logger.error(f"Error in restartloop: {e}")
@@ -1716,6 +1760,8 @@ def run_telegram():
         app_tg.add_handler(CommandHandler("help", help_cmd))
         app_tg.add_handler(CommandHandler("ping", ping_cmd))
         app_tg.add_handler(CommandHandler("loopstatus", loopstatus_cmd))
+        app_tg.add_handler(CommandHandler("version", version_cmd))
+        app_tg.add_handler(CommandHandler("testtrade", testtrade_cmd))
         app_tg.add_handler(CommandHandler("status", status_cmd))
         app_tg.add_handler(CommandHandler("performance", performance))
         app_tg.add_handler(CommandHandler("backtest", backtest))
