@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Multi-Asset Consensus Trading Bot – FINAL WITH VERSION & TEST TRADE
+Multi-Asset Consensus Trading Bot – FINAL WITH VERSION & TEST TRADE (FIXED THREADING)
 """
 
 import os
@@ -101,7 +101,7 @@ class Config:
     INITIAL_BALANCE = float(os.getenv("INITIAL_BALANCE", "10000.0"))
     MAX_POSITIONS_GLOBAL = int(os.getenv("MAX_POSITIONS_GLOBAL", "5"))
     MAX_POSITIONS_PER_SYMBOL = int(os.getenv("MAX_POSITIONS_PER_SYMBOL", "1"))
-    PER_TRADE_RISK_PCT = float(os.getenv("PER_TRADE_RISK_PCT", "0.01"))  # 1% risk per trade
+    PER_TRADE_RISK_PCT = float(os.getenv("PER_TRADE_RISK_PCT", "0.01"))
     MAX_DAILY_LOSS_PCT = float(os.getenv("MAX_DAILY_LOSS_PCT", "0.05"))
     MAX_DRAWDOWN = float(os.getenv("MAX_DRAWDOWN", "0.10"))
     CONSENSUS_THRESHOLD = float(os.getenv("CONSENSUS_THRESHOLD", "0.25"))
@@ -802,7 +802,7 @@ class LiveBroker:
         logger.info(f"[LIVE] {side} {size} {symbol} at {price}")
         return {"status": "live_placeholder"}
 
-# ---------------------------- MULTI-ASSET TRADER (with full logging & test commands) ----------------------------
+# ---------------------------- MULTI-ASSET TRADER (FIXED) ----------------------------
 class MultiTrader:
     def __init__(self, symbols, initial_balance, risk_mgr, db, telegram_token, chat_id, live_broker):
         debug_print("MultiTrader __init__ entered.")
@@ -827,12 +827,15 @@ class MultiTrader:
             self.override_settings = self.settings_manager.get(int(chat_id))
         self._init_symbols(symbols)
         self._init_market_data()
+
+        # ---- Thread control ----
         self.running = True
-        self.performance_logger = PerformanceLogger(Config.CSV_FILE)
-        self.last_prices = {}
-        self.heartbeat_counter = 0
-        self.optimal_thresholds = {}
         self.loop_thread = None
+        self.monitor_thread = None
+        self.heartbeat_counter = 0
+
+        self.performance_logger = PerformanceLogger(Config.CSV_FILE)
+        self.optimal_thresholds = {}
 
         if Config.OPTIMIZE_ON_START:
             logger.info("Starting optimization in background thread...")
@@ -840,38 +843,18 @@ class MultiTrader:
         else:
             logger.info("Optimization disabled (OPTIMIZE_ON_START=false)")
 
-        debug_print("Starting heartbeat thread...")
-        self.heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=False)
-        self.heartbeat_thread.start()
-        debug_print("Heartbeat thread started.")
-
+        # Start the trading loop thread
         self._start_loop_thread()
 
-        debug_print("Starting loop monitor thread...")
+        # Start the monitor thread
         self.monitor_thread = threading.Thread(target=self._monitor_loop, daemon=False)
         self.monitor_thread.start()
         debug_print("Loop monitor thread started.")
 
-    def _start_loop_thread(self):
-        debug_print("Starting trading loop thread...")
-        self.loop_thread = threading.Thread(target=self._run_loop_wrapper, daemon=False)
-        self.loop_thread.start()
-        debug_print(f"Trading loop thread started (daemon={self.loop_thread.daemon}).")
-
-    def _monitor_loop(self):
-        while True:
-            if self.loop_thread is None or not self.loop_thread.is_alive():
-                debug_print("Loop thread is dead or None. Restarting...")
-                self._start_loop_thread()
-            time.sleep(10)
-
-    def _heartbeat_loop(self):
-        counter = 0
-        while True:
-            counter += 1
-            print(f"[HEARTBEAT] Counter: {counter} (PID: {os.getpid()})")
-            sys.stdout.flush()
-            time.sleep(10)
+        # Heartbeat thread
+        self.heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=False)
+        self.heartbeat_thread.start()
+        debug_print("Heartbeat thread started.")
 
     def _init_symbols(self, default_symbols):
         if self.override_settings and 'symbols' in self.override_settings:
@@ -897,6 +880,105 @@ class MultiTrader:
                 WhaleSource(self.markets[sym], self.db),
             ]
 
+    # ---------- Loop thread management ----------
+    def _start_loop_thread(self):
+        if self.loop_thread is not None and self.loop_thread.is_alive():
+            logger.warning("Trading loop thread already running.")
+            return
+        self.running = True
+        self.loop_thread = threading.Thread(target=self._trading_loop, daemon=False)
+        self.loop_thread.start()
+        debug_print(f"Trading loop thread started (daemon={self.loop_thread.daemon}).")
+
+    def _monitor_loop(self):
+        """Monitor the trading loop thread and restart if it dies."""
+        while True:
+            if self.loop_thread is None or not self.loop_thread.is_alive():
+                debug_print("Monitor: Trading loop thread is dead. Restarting...")
+                self._start_loop_thread()
+            time.sleep(10)
+
+    def _heartbeat_loop(self):
+        counter = 0
+        while True:
+            counter += 1
+            print(f"[HEARTBEAT] Counter: {counter} (PID: {os.getpid()})")
+            sys.stdout.flush()
+            time.sleep(10)
+
+    # ---------- The main trading loop ----------
+    def _trading_loop(self):
+        debug_print(">>> TRADING LOOP STARTED (in _trading_loop)")
+        logger.info("Trading loop thread is now active.")
+        print(">>> TRADING LOOP: ACTIVE")
+        sys.stdout.flush()
+
+        iteration = 0
+        while self.running:
+            iteration += 1
+            print(f"LOOP ITERATION #{iteration} at {datetime.now().isoformat()}")
+            sys.stdout.flush()
+            logger.info(f"Trading loop iteration {iteration}")
+
+            try:
+                self._step()
+                self.heartbeat_counter += 1
+                if self.heartbeat_counter % 5 == 0:
+                    logger.info("Trading loop heartbeat – alive")
+                time.sleep(Config.TRADE_INTERVAL_SECONDS)
+            except Exception as e:
+                logger.error(f"Error in trading loop iteration: {e}", exc_info=True)
+                debug_print(f"Loop iteration error: {e}")
+                time.sleep(Config.TRADE_INTERVAL_SECONDS)
+
+        debug_print("Trading loop exited because running = False.")
+
+    # ---------- The step logic ----------
+    def _step(self):
+        """One iteration of the trading loop – processes all symbols."""
+        logger.debug("STEP: Entering _step()")
+        for symbol in self.symbols:
+            logger.debug(f"STEP: Processing {symbol}")
+            result = self.get_price_and_atr(symbol, timeframe='1hour')
+            if result is None or result[0] is None:
+                logger.warning(f"STEP: No price data for {symbol}")
+                continue
+            price, atr, trend_ok, trend_ma = result
+
+            # Check SL/TP for open positions
+            pnl, status, pos = self.risk_mgr.check_sl_tp(symbol, price)
+            if pnl != 0 and pos is not None:
+                with self.balance_lock:
+                    self.balance += pnl
+                self.risk_mgr.update_balance(self.balance)
+                self.risk_mgr.update_daily_pnl(pnl)
+                pnl_pct = (pnl / (pos['entry'] * pos['size'])) * 100
+                self.performance_logger.log_trade(
+                    int(time.time()), symbol, pos['side'],
+                    pos['entry'], price, pos['size'],
+                    pnl, pnl_pct, status, self.balance
+                )
+                emoji = "✅" if pnl > 0 else "❌"
+                self.send_alert(
+                    f"{emoji} <b>{symbol} CLOSED</b> ({status})\n"
+                    f"Entry: ${pos['entry']:.4f} | Exit: ${price:.4f}\n"
+                    f"PnL: ${pnl:.2f} ({pnl_pct:+.2f}%) | Balance: ${self.balance:.2f}"
+                )
+
+            # Skip if we already have an open position for this symbol
+            if self.risk_mgr.open_positions.get(symbol, []):
+                logger.debug(f"STEP: Symbol {symbol} has open position(s), skipping")
+                continue
+
+            # Generate consensus signal
+            direction, tf_details = self.get_multi_tf_signal(symbol, price, atr, trend_ok)
+            if direction != 0:
+                logger.info(f"STEP: Consensus for {symbol}: direction={direction}")
+                self.execute_signal(symbol, direction, price, atr, tf_details, trend_ok)
+            else:
+                logger.debug(f"STEP: No consensus for {symbol}")
+
+    # ---------- Helper methods (unchanged from original) ----------
     def reload_settings(self):
         if self.chat_id:
             self.override_settings = self.settings_manager.get(int(self.chat_id))
@@ -1223,74 +1305,10 @@ class MultiTrader:
         )
         self.send_alert(msg)
 
+    # Public method for external scan (Telegram)
     def step(self):
-        logger.info("STEP: Entering step()")
-        for symbol in self.symbols:
-            logger.info(f"STEP: Processing {symbol}")
-            result = self.get_price_and_atr(symbol, timeframe='1hour')
-            if result is None or result[0] is None:
-                logger.warning(f"STEP: No price data for {symbol}")
-                continue
-            price, atr, trend_ok, trend_ma = result
-
-            pnl, status, pos = self.risk_mgr.check_sl_tp(symbol, price)
-            if pnl != 0 and pos is not None:
-                with self.balance_lock:
-                    self.balance += pnl
-                self.risk_mgr.update_balance(self.balance)
-                self.risk_mgr.update_daily_pnl(pnl)
-                pnl_pct = (pnl / (pos['entry'] * pos['size'])) * 100
-                self.performance_logger.log_trade(
-                    int(time.time()), symbol, pos['side'],
-                    pos['entry'], price, pos['size'],
-                    pnl, pnl_pct, status, self.balance
-                )
-                emoji = "✅" if pnl > 0 else "❌"
-                self.send_alert(
-                    f"{emoji} <b>{symbol} CLOSED</b> ({status})\n"
-                    f"Entry: ${pos['entry']:.4f} | Exit: ${price:.4f}\n"
-                    f"PnL: ${pnl:.2f} ({pnl_pct:+.2f}%) | Balance: ${self.balance:.2f}"
-                )
-
-            if self.risk_mgr.open_positions.get(symbol, []):
-                logger.info(f"STEP: Symbol {symbol} has open position(s), skipping")
-                continue
-
-            direction, tf_details = self.get_multi_tf_signal(symbol, price, atr, trend_ok)
-            if direction != 0:
-                logger.info(f"STEP: Consensus for {symbol}: direction={direction}")
-                self.execute_signal(symbol, direction, price, atr, tf_details, trend_ok)
-            else:
-                logger.debug(f"STEP: No consensus for {symbol}")
-
-    def _run_loop_wrapper(self):
-        debug_print("_run_loop_wrapper: Thread started (non-daemon).")
-        while True:
-            try:
-                self.running = True
-                self.run_loop()
-            except Exception as e:
-                logger.error(f"Trading loop crashed: {e}. Restarting in 10 seconds...", exc_info=True)
-                debug_print(f"Trading loop crashed: {e}")
-                time.sleep(10)
-                continue
-
-    def run_loop(self):
-        debug_print("run_loop: Entered main loop.")
-        logger.info("Starting multi-asset trading loop. Symbols: %s", self.symbols)
-        while self.running:
-            logger.info("LOOP: Iteration")
-            debug_print("LOOP: Iteration")
-            try:
-                self.step()
-                self.heartbeat_counter += 1
-                if self.heartbeat_counter % 5 == 0:
-                    logger.info("Trading loop heartbeat – alive")
-                time.sleep(Config.TRADE_INTERVAL_SECONDS)
-            except Exception as e:
-                logger.error(f"Loop error: {e}", exc_info=True)
-                debug_print(f"Loop error: {e}")
-                time.sleep(Config.TRADE_INTERVAL_SECONDS)
+        """Public wrapper for _step (used by Telegram /scan)."""
+        self._step()
 
     def backtest(self, symbol, lookback_days=30, timeframe='1hour'):
         if lookback_days > 60:
@@ -1386,7 +1404,7 @@ async def loopstatus_cmd(update: Update, context):
     await update.message.reply_text(msg, reply_markup=get_main_keyboard())
 
 async def version_cmd(update: Update, context):
-    await update.message.reply_text("Version: 2026-08-26-01 (with full logging and test commands)", reply_markup=get_main_keyboard())
+    await update.message.reply_text("Version: 2026-08-28-01 (fixed threading)", reply_markup=get_main_keyboard())
 
 async def testtrade_cmd(update: Update, context):
     if trader_global is None:
